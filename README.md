@@ -1,19 +1,20 @@
-# Road/Rail Polygon Snapper V4
+# Road/Rail Polygon Snapper V5
 
 A Streamlit MVP for snapping a user-drawn polygon to nearby OpenStreetMap road/rail linework.
 
-V4 is designed for polygon geometry, not routing. It does **not** obey one-way streets, pedestrian crossings, or walking rules. It builds closed road-network cells and returns a polygon boundary snapped to roads/rails.
+V5 is for **polygon boundaries**, not walking/driving routes. It ignores one-way direction, pedestrian crossings, and routing rules. The app builds closed road-network cells and selects the best-fitting closed polygon against the user's drawn polygon.
 
-## What V4 fixes
+## What V5 fixes
 
-Compared with earlier versions:
+Compared with V4:
 
-- Prioritizes a closed polygon, not a shortest human path.
-- Prunes dead-end branches so red lines do not poke out into nowhere.
-- Excludes pedestrian paths, crossings, tracks, cycleways, and footways by default.
-- Excludes service roads by default.
-- Lets you switch to main roads only if you want to ignore smaller side streets.
-- Simplifies the output so the snapped polygon has fewer coordinate points.
+- Keeps the **best-fitting** closed component, not the largest component.
+- Scores the whole output polygon against the input polygon using coverage, outside bulge, missing area, boundary distance, area difference, and simplicity.
+- Removes/adds whole closed road cells to improve the fit.
+- Avoids red shapes that expand into unrelated neighborhoods.
+- Defaults to **Main roads only**, so small side roads are less likely to create noisy boundaries.
+- Still excludes pedestrian paths, footways, crossings, cycleways, tracks, and steps.
+- Excludes service roads unless explicitly enabled.
 
 ## Files
 
@@ -51,34 +52,42 @@ streamlit run app.py
 4. Use `app.py` as the main file.
 5. Deploy.
 
-## Recommended settings
+## Recommended settings for clean polygons
 
-For clean polygons:
+Start with:
 
 ```text
 Snap to: Roads only
-Road tier: Public streets, no service roads or paths
-Search buffer: 300 m
-Cell inclusion threshold: 20%
-Ignore tiny cells below: 500 m²
-Simplify output tolerance: 8 m
-Keep largest component: on
-Prune dead-end branches: on
-```
-
-If the polygon still includes too many side roads:
-
-```text
 Road tier: Main roads only
+Fit behavior: Tight / avoid outside bulges
+Search buffer: 300-400 m
+Ignore tiny closed cells below: 750 m2
+Ignore very large cells above input-area multiple: 2.0
+Minimum cell overlap with input polygon: 35%
+Maximum outside share for center-inside cells: 65%
+Simplify output tolerance: 10-15 m
+Prune dead-end branches: on
+Best-fit refinement iterations: 30
 ```
 
-If the polygon becomes too coarse or cannot find cells:
+If the red output is still too large:
 
 ```text
-Road tier: Public streets, no service roads or paths
-Increase search buffer
-Lower cell inclusion threshold
-Lower ignore tiny cells threshold
+Fit behavior: Tight / avoid outside bulges
+Lower max cell area multiple to 1.5
+Raise minimum cell overlap to 45-55%
+Lower max outside share to 45-55%
+Use Arterial roads only
+```
+
+If the red output is too small or fails to close:
+
+```text
+Fit behavior: Cover input polygon more
+Use Public streets, no service roads or paths
+Increase search buffer to 500-700 m
+Lower minimum cell overlap to 20-30%
+Increase max cell area multiple to 3.0-4.0
 ```
 
 ## How it works
@@ -86,17 +95,20 @@ Lower ignore tiny cells threshold
 1. The user draws a polygon.
 2. The app queries nearby OpenStreetMap roads/rails.
 3. It filters the network to the selected road tier.
-4. It converts the network into undirected linework.
+4. It makes the network undirected.
 5. It prunes dead-end branches.
-6. It polygonizes the remaining road/rail linework into closed cells.
-7. It selects cells that overlap the drawn polygon.
-8. It dissolves selected cells into one snapped polygon.
-9. It simplifies the output to reduce coordinate count.
-10. It returns GeoJSON.
+6. It polygonizes the linework into closed road cells.
+7. It selects plausible cells that overlap the drawn polygon.
+8. It scores the full output polygon, not just individual cells.
+9. It greedily removes cells that create outside bulges and adds cells only when they improve fit.
+10. It keeps the best-fitting closed component.
+11. It simplifies the final output.
+12. It returns GeoJSON.
 
 ## Limitations
 
-- This uses road/rail centerlines, not curb or parcel boundaries.
-- If roads do not form closed cells in the selected area, the app may fail or return a simpler nearby component.
-- Rail lines may create unexpected cells when mixed with roads.
-- Live OSM/Overpass queries can be slow for very large polygons. For production, use local OSM data with PostGIS/pgRouting or a tiled/network service.
+- This uses road/rail centerlines, not curb, parcel, or administrative boundaries.
+- If roads do not form closed cells around the drawn polygon, the app may return a smaller/larger nearby road-cell polygon.
+- Overpasses and bridges may still create artificial cells because OSM centerlines can geometrically cross.
+- Rail lines can split cells in unexpected ways; Roads only is usually cleaner.
+- Live OSM/Overpass queries can be slow for large polygons. For production, use local OSM data with PostGIS/pgRouting or a prebuilt network service.
