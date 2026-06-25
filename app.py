@@ -20,7 +20,7 @@ st.set_page_config(
 
 st.title("🗺️ Polygon Road/Rail Snapper")
 st.caption(
-    "Draw a polygon, then snap its boundary inward/outward to the nearest OpenStreetMap roads and rail lines."
+    "Draw a polygon, then snap its boundary inward/outward to nearby OpenStreetMap roads and rail lines."
 )
 
 
@@ -31,6 +31,8 @@ def snap_cached(
     search_buffer_m: float,
     sample_spacing_m: float,
     max_snap_distance_m: float,
+    candidate_count: int,
+    switch_penalty_m: float,
 ) -> dict[str, Any]:
     """Cache expensive OSM calls and snapping results."""
     drawn_geojson = json.loads(drawn_geojson_string)
@@ -40,6 +42,8 @@ def snap_cached(
         search_buffer_m=search_buffer_m,
         sample_spacing_m=sample_spacing_m,
         max_snap_distance_m=max_snap_distance_m,
+        candidate_count=candidate_count,
+        switch_penalty_m=switch_penalty_m,
     )
     return result.__dict__
 
@@ -71,23 +75,41 @@ with st.sidebar:
         "Boundary sample spacing, meters",
         min_value=5,
         max_value=100,
-        value=25,
+        value=15,
         step=5,
-        help="Lower values hug roads more closely but produce more points and slower processing.",
+        help="Lower values sample the polygon more closely. 10-20m usually works well in cities.",
     )
 
     max_snap_distance_m = st.slider(
         "Max snap distance, meters",
         min_value=10,
         max_value=500,
-        value=150,
+        value=120,
         step=10,
-        help="A boundary point farther than this from a road/rail line will stay in its original position.",
+        help="Boundary samples farther than this from a road/rail line are ignored.",
+    )
+
+    candidate_count = st.slider(
+        "Nearby candidates per sample",
+        min_value=1,
+        max_value=10,
+        value=5,
+        step=1,
+        help="Higher values let the algorithm choose a smoother nearby road instead of always the single nearest one.",
+    )
+
+    switch_penalty_m = st.slider(
+        "Road-switch penalty, meters",
+        min_value=0,
+        max_value=150,
+        value=35,
+        step=5,
+        help="Higher values reduce zig-zags by discouraging jumps between parallel roads.",
     )
 
     st.divider()
     st.markdown(
-        "**Tip:** start with a small polygon. Very large polygons can be slow because the app queries OpenStreetMap live."
+        "**Important:** this V2 output uses actual OSM road/rail linework. It avoids fake diagonal connectors."
     )
 
 
@@ -137,7 +159,6 @@ with right:
         st.info("Draw one polygon on the map. The snap controls will appear here after the drawing is detected.")
         st.stop()
 
-    # Use the last drawing so the user can redraw without clearing every object.
     drawn = drawings[-1]
     drawn_geojson_string = json.dumps(drawn, sort_keys=True)
 
@@ -153,9 +174,11 @@ with right:
                     search_buffer_m=float(search_buffer_m),
                     sample_spacing_m=float(sample_spacing_m),
                     max_snap_distance_m=float(max_snap_distance_m),
+                    candidate_count=int(candidate_count),
+                    switch_penalty_m=float(switch_penalty_m),
                 )
                 st.session_state["snap_result"] = result
-            except Exception as exc:  # noqa: BLE001 - show user-friendly Streamlit error
+            except Exception as exc:  # noqa: BLE001
                 st.error(str(exc))
                 st.stop()
 
@@ -167,17 +190,22 @@ with right:
 
         st.metric("Network line features found", result["network_features_count"])
         st.metric("Boundary sample points", result["sampled_points_count"])
+        st.metric("Road-aligned pieces", result["road_aligned_segments_count"])
+        st.metric("Skipped fake transitions", result["skipped_transition_count"])
         st.metric("Mean snap distance", f"{result['mean_snap_distance_m']:.1f} m")
         st.metric("Max nearest distance", f"{result['max_snap_distance_m']:.1f} m")
 
         snapped_feature = {
             "type": "Feature",
             "properties": {
-                "name": "snapped_boundary",
+                "name": "snapped_boundary_v2",
                 "target": target_label,
                 "sample_spacing_m": sample_spacing_m,
                 "search_buffer_m": search_buffer_m,
                 "max_snap_distance_m": max_snap_distance_m,
+                "candidate_count": candidate_count,
+                "switch_penalty_m": switch_penalty_m,
+                "note": "V2 uses actual road/rail linework and intentionally avoids fake diagonal connectors.",
             },
             "geometry": result["snapped_line_geojson"],
         }
@@ -190,18 +218,18 @@ with right:
         st.download_button(
             "Download snapped GeoJSON",
             data=json.dumps(feature_collection, indent=2),
-            file_name="snapped_polygon_boundary.geojson",
+            file_name="snapped_polygon_boundary_v2.geojson",
             mime="application/geo+json",
             use_container_width=True,
         )
 
-        st.subheader("3. Preview snapped line")
+        st.subheader("3. Preview snapped linework")
 
         original_geom = shape(drawn["geometry"])
         minx, miny, maxx, maxy = original_geom.bounds
         preview_center = [(miny + maxy) / 2, (minx + maxx) / 2]
 
-        preview = folium.Map(location=preview_center, zoom_start=14, tiles="OpenStreetMap")
+        preview = folium.Map(location=preview_center, zoom_start=16, tiles="OpenStreetMap")
 
         folium.GeoJson(
             drawn,
@@ -211,7 +239,7 @@ with right:
 
         folium.GeoJson(
             snapped_feature,
-            name="Snapped boundary",
+            name="Snapped road/rail linework",
             style_function=lambda _: {"color": "red", "weight": 5},
         ).add_to(preview)
 

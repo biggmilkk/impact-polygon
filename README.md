@@ -1,47 +1,63 @@
-# Polygon Road/Rail Snapper
+# Polygon Road/Rail Snapper for Streamlit
 
-A Streamlit MVP that lets a user draw a polygon and snaps the polygon boundary inward/outward to the nearest OpenStreetMap roads and rail lines.
+This is a Streamlit MVP that lets a user draw a polygon and snap the polygon boundary to nearby OpenStreetMap roads and rail lines.
 
-## What it does
+## V2 behavior
 
-1. User draws a polygon in a Folium map.
-2. The app samples points along the polygon boundary.
-3. It queries OpenStreetMap for nearby roads and rail lines using OSMnx.
-4. Each sampled boundary point is projected onto the nearest road/rail geometry.
-5. The app returns a snapped GeoJSON LineString.
+The first version connected independently snapped points with straight red lines. That creates ugly diagonal shortcuts across streets.
 
-## Repo structure
+This version fixes that by outputting actual OpenStreetMap road/rail linework:
+
+1. Sample the polygon boundary.
+2. Find nearby road/rail candidates for each sample.
+3. Use a road-switch penalty to reduce zig-zags between parallel roads.
+4. Extract the actual OSM line segments between consecutive samples on the same road/rail feature.
+5. Do not connect transitions that would create fake diagonal lines.
+
+The output may be a `MultiLineString` instead of one perfectly closed polygon. That is expected when nearby roads do not form a continuous clean boundary.
+
+## Files
 
 ```text
-.
-├── app.py
-├── snapper.py
-├── requirements.txt
-├── .gitignore
-└── README.md
+app.py
+snapper.py
+requirements.txt
+README.md
+.gitignore
 ```
 
-## Local setup
+## Local run
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # macOS/Linux
-# .venv\Scripts\activate   # Windows PowerShell
+source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy to Streamlit Community Cloud
+On Windows PowerShell:
 
-1. Push this repo to GitHub.
-2. Go to Streamlit Community Cloud.
-3. Create a new app.
-4. Select your repo.
-5. Set the main file path to `app.py`.
-6. Deploy.
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-## Notes
+## Deploy on Streamlit Community Cloud
 
-- This app queries OpenStreetMap live, so very large polygons can be slow.
-- For production, import a local OSM extract into PostGIS/pgRouting or use a dedicated tile/routing backend.
-- The output is a snapped `LineString`, not a guaranteed valid polygon. Roads and rails do not always form a closed polygon.
+1. Push this folder to GitHub.
+2. Create a new Streamlit app.
+3. Select your GitHub repo.
+4. Set the main file path to `app.py`.
+5. Deploy.
+
+## Recommended settings for dense cities
+
+- Search buffer: 150-250m
+- Boundary sample spacing: 10-20m
+- Max snap distance: 80-150m
+- Nearby candidates: 5
+- Road-switch penalty: 30-60m
+
+Increase the road-switch penalty if the snapped line jumps between parallel roads. Lower it if it sticks to the wrong road for too long.
