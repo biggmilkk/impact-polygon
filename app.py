@@ -9,19 +9,19 @@ from folium.plugins import Draw
 from shapely.geometry import shape
 from streamlit_folium import st_folium
 
-from snapper import snap_polygon_to_closed_network_loop
+from snapper import snap_polygon_to_road_rail_polygon
 
 
 st.set_page_config(
-    page_title="Closed Loop Road Snapper",
+    page_title="Road/Rail Polygon Snapper V4",
     page_icon="🗺️",
     layout="wide",
 )
 
-st.title("🗺️ Closed Loop Road/Rail Snapper")
+st.title("🗺️ Road/Rail Polygon Snapper V4")
 st.caption(
-    "Draw a polygon, then fit it to a nearby connected OpenStreetMap road/rail loop. "
-    "V3 prioritizes closure instead of snapping each point independently."
+    "Draw a polygon. The app builds closed road-network cells and returns a polygon boundary snapped to roads/rails. "
+    "This version is for polygon geometry, not human routing."
 )
 
 
@@ -29,23 +29,25 @@ st.caption(
 def snap_cached(
     drawn_geojson_string: str,
     target: str,
+    road_tier: str,
     search_buffer_m: float,
-    control_spacing_m: float,
-    max_snap_distance_m: float,
-    candidate_count: int,
-    boundary_closeness_weight: float,
-    max_control_points: int,
+    min_cell_overlap: float,
+    min_cell_area_m2: float,
+    simplify_tolerance_m: float,
+    keep_largest_component: bool,
+    prune_dead_ends: bool,
 ) -> dict[str, Any]:
     drawn_geojson = json.loads(drawn_geojson_string)
-    result = snap_polygon_to_closed_network_loop(
+    result = snap_polygon_to_road_rail_polygon(
         drawn_geojson=drawn_geojson,
         target=target,  # type: ignore[arg-type]
+        road_tier=road_tier,  # type: ignore[arg-type]
         search_buffer_m=search_buffer_m,
-        control_spacing_m=control_spacing_m,
-        max_snap_distance_m=max_snap_distance_m,
-        candidate_count=candidate_count,
-        boundary_closeness_weight=boundary_closeness_weight,
-        max_control_points=max_control_points,
+        min_cell_overlap=min_cell_overlap,
+        min_cell_area_m2=min_cell_area_m2,
+        simplify_tolerance_m=simplify_tolerance_m,
+        keep_largest_component=keep_largest_component,
+        prune_dead_ends=prune_dead_ends,
     )
     return result.__dict__
 
@@ -57,12 +59,31 @@ with st.sidebar:
         "Snap to",
         ["Roads only", "Roads + rail", "Rail only"],
         index=0,
-        help="Roads only is usually best for closed loops. Roads + rail can be fragmented if rail lines do not connect to roads.",
+        help="Roads only is usually cleanest for polygon boundaries. Rail can be useful when rails are intended as boundaries.",
     )
     target_map = {
         "Roads only": "roads",
         "Roads + rail": "roads_and_rails",
         "Rail only": "rails",
+    }
+
+    road_tier_label = st.selectbox(
+        "Road tier",
+        [
+            "Public streets, no service roads or paths",
+            "Main roads only",
+            "All drivable roads incl. service roads",
+        ],
+        index=0,
+        help=(
+            "Use Main roads only to ignore more small side roads. "
+            "The default excludes footways, pedestrian paths, crossings, tracks, cycleways, and service roads."
+        ),
+    )
+    road_tier_map = {
+        "Main roads only": "main",
+        "Public streets, no service roads or paths": "public",
+        "All drivable roads incl. service roads": "all_drivable",
     }
 
     search_buffer_m = st.slider(
@@ -71,58 +92,55 @@ with st.sidebar:
         max_value=1500,
         value=300,
         step=50,
-        help="Larger values give the loop algorithm more possible roads to close the shape, but queries become slower.",
+        help="Larger values give the polygonizer more road cells around the drawn polygon, but queries become slower.",
     )
 
-    control_spacing_m = st.slider(
-        "Loop control-point spacing, meters",
-        min_value=20,
-        max_value=200,
-        value=60,
-        step=10,
-        help="Lower values preserve the drawn shape more closely. Higher values are faster and smoother.",
+    min_cell_overlap_pct = st.slider(
+        "Cell inclusion threshold",
+        min_value=5,
+        max_value=80,
+        value=20,
+        step=5,
+        help=(
+            "Lower includes more nearby road cells, often expanding outward. "
+            "Higher is stricter and may shrink inward. Start at 20%."
+        ),
     )
 
-    max_snap_distance_m = st.slider(
-        "Max candidate distance, meters",
-        min_value=20,
-        max_value=600,
-        value=180,
-        step=20,
-        help="Candidate road nodes farther than this are ignored unless no candidate exists for a control point.",
+    min_cell_area_m2 = st.slider(
+        "Ignore tiny closed cells below, m²",
+        min_value=0,
+        max_value=10000,
+        value=500,
+        step=250,
+        help="Raises the floor for tiny polygons created by small traffic islands or mapping artifacts.",
     )
 
-    candidate_count = st.slider(
-        "Nearby candidates per control point",
-        min_value=2,
-        max_value=10,
-        value=5,
+    simplify_tolerance_m = st.slider(
+        "Simplify output tolerance, meters",
+        min_value=0,
+        max_value=50,
+        value=8,
         step=1,
-        help="Higher values give the algorithm more options for finding a closed loop.",
+        help="Higher values produce fewer coordinate points. Too high can oversimplify corners.",
     )
 
-    boundary_closeness_weight = st.slider(
-        "Boundary closeness weight",
-        min_value=1.0,
-        max_value=20.0,
-        value=6.0,
-        step=0.5,
-        help="Higher values keep the result closer to the drawn polygon. Lower values prioritize simpler/shorter connected loops.",
+    keep_largest_component = st.checkbox(
+        "Keep only largest closed component",
+        value=True,
+        help="Recommended. Prevents disconnected little road cells from becoming extra polygons.",
     )
 
-    max_control_points = st.slider(
-        "Max control points",
-        min_value=20,
-        max_value=120,
-        value=70,
-        step=10,
-        help="Safety limit for Streamlit Cloud. Increase for large polygons if performance is acceptable.",
+    prune_dead_ends = st.checkbox(
+        "Prune dead-end branches before polygonizing",
+        value=True,
+        help="Recommended. Removes cul-de-sacs and dangling linework so the red result does not poke out into nowhere.",
     )
 
     st.divider()
     st.markdown(
-        "**V3 behavior:** chooses roads that can connect back to the start. "
-        "It may move slightly inward/outward or choose a slightly farther road if that helps form a closed loop."
+        "**V4 behavior:** no one-way rules, no pedestrian routing, no diagonal shortcuts. "
+        "It polygonizes road/rail linework and returns a closed snapped boundary."
     )
 
 
@@ -178,64 +196,76 @@ with right:
     with st.expander("Raw drawn GeoJSON", expanded=False):
         st.json(drawn)
 
-    if st.button("Snap to closed road/rail loop", type="primary", use_container_width=True):
-        with st.spinner("Querying OpenStreetMap and solving the closed loop..."):
+    if st.button("Snap to closed road/rail polygon", type="primary", use_container_width=True):
+        with st.spinner("Querying OpenStreetMap and building closed road cells..."):
             try:
                 result = snap_cached(
                     drawn_geojson_string=drawn_geojson_string,
                     target=target_map[target_label],
+                    road_tier=road_tier_map[road_tier_label],
                     search_buffer_m=float(search_buffer_m),
-                    control_spacing_m=float(control_spacing_m),
-                    max_snap_distance_m=float(max_snap_distance_m),
-                    candidate_count=int(candidate_count),
-                    boundary_closeness_weight=float(boundary_closeness_weight),
-                    max_control_points=int(max_control_points),
+                    min_cell_overlap=float(min_cell_overlap_pct / 100),
+                    min_cell_area_m2=float(min_cell_area_m2),
+                    simplify_tolerance_m=float(simplify_tolerance_m),
+                    keep_largest_component=bool(keep_largest_component),
+                    prune_dead_ends=bool(prune_dead_ends),
                 )
-                st.session_state["snap_result_v3"] = result
+                st.session_state["snap_result_v4"] = result
             except Exception as exc:  # noqa: BLE001
                 st.error(str(exc))
                 st.stop()
 
-    result = st.session_state.get("snap_result_v3")
+    result = st.session_state.get("snap_result_v4")
 
     if result:
         if result.get("warning"):
             st.warning(result["warning"])
 
         closed_text = "Yes" if result["closed_loop"] else "No"
-        st.metric("Closed loop found", closed_text)
+        st.metric("Closed polygon", closed_text)
+        st.metric("Algorithm", result["algorithm"])
         st.metric("Network nodes", result["network_nodes_count"])
         st.metric("Network edges", result["network_edges_count"])
-        st.metric("Control points", result["control_points_count"])
-        st.metric("Route pieces", result["route_piece_count"])
-        st.metric("Mean snap distance", f"{result['mean_snap_distance_m']:.1f} m")
-        st.metric("Output length", f"{result['output_length_m']:.0f} m")
+        st.metric("Candidate road cells", result["candidate_cells_count"])
+        st.metric("Selected road cells", result["selected_cells_count"])
+        st.metric("Coordinate points", result["coordinate_count"])
+        st.metric("Output area", f"{result['output_area_m2']:.0f} m²")
+        st.metric("Output perimeter", f"{result['output_perimeter_m']:.0f} m")
 
-        snapped_feature = {
+        snapped_polygon_feature = {
             "type": "Feature",
             "properties": {
-                "name": "snapped_boundary_v3_closed_loop",
+                "name": "snapped_polygon_v4",
                 "target": target_label,
+                "road_tier": road_tier_label,
                 "search_buffer_m": search_buffer_m,
-                "control_spacing_m": control_spacing_m,
-                "max_snap_distance_m": max_snap_distance_m,
-                "candidate_count": candidate_count,
-                "boundary_closeness_weight": boundary_closeness_weight,
-                "closed_loop": result["closed_loop"],
-                "note": "V3 prioritizes a connected closed loop using real OSM network linework.",
+                "min_cell_overlap_pct": min_cell_overlap_pct,
+                "min_cell_area_m2": min_cell_area_m2,
+                "simplify_tolerance_m": simplify_tolerance_m,
+                "note": "V4 polygonizes road/rail cells. It is not a pedestrian/driving route.",
             },
-            "geometry": result["snapped_line_geojson"],
+            "geometry": result["snapped_geojson"],
+        }
+
+        snapped_boundary_feature = {
+            "type": "Feature",
+            "properties": {
+                "name": "snapped_boundary_v4",
+                "target": target_label,
+                "road_tier": road_tier_label,
+            },
+            "geometry": result["snapped_boundary_geojson"],
         }
 
         feature_collection = {
             "type": "FeatureCollection",
-            "features": [snapped_feature],
+            "features": [snapped_polygon_feature, snapped_boundary_feature],
         }
 
         st.download_button(
             "Download snapped GeoJSON",
             data=json.dumps(feature_collection, indent=2),
-            file_name="snapped_closed_loop_v3.geojson",
+            file_name="snapped_polygon_v4.geojson",
             mime="application/geo+json",
             use_container_width=True,
         )
@@ -250,13 +280,24 @@ with right:
 
         folium.GeoJson(
             drawn,
-            name="Original polygon",
-            style_function=lambda _: {"color": "blue", "weight": 2, "fillOpacity": 0.05},
+            name="Original drawn polygon",
+            style_function=lambda _: {"color": "blue", "weight": 2, "fillOpacity": 0.04},
         ).add_to(preview)
 
         folium.GeoJson(
-            snapped_feature,
-            name="Snapped closed loop",
+            snapped_polygon_feature,
+            name="Snapped polygon fill",
+            style_function=lambda _: {
+                "color": "red",
+                "weight": 4,
+                "fillColor": "red",
+                "fillOpacity": 0.08,
+            },
+        ).add_to(preview)
+
+        folium.GeoJson(
+            snapped_boundary_feature,
+            name="Snapped polygon boundary",
             style_function=lambda _: {"color": "red", "weight": 5},
         ).add_to(preview)
 

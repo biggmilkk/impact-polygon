@@ -1,9 +1,8 @@
 __pycache__/
 *.py[cod]
-.env
 .venv/
 venv/
-.ipynb_checkpoints/
-.streamlit/secrets.toml
+.env
 .DS_Store
-*.log
+.streamlit/secrets.toml
+*.geojson

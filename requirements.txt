@@ -5,5 +5,5 @@ osmnx>=2.0
 geopandas>=1.0
 shapely>=2.0
 pyproj>=3.6
-networkx>=3.2
 numpy>=1.26
+networkx>=3.2

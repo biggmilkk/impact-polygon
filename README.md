@@ -1,22 +1,19 @@
-# Closed Loop Road/Rail Snapper for Streamlit
+# Road/Rail Polygon Snapper V4
 
-This Streamlit app lets a user draw a rough polygon and snaps it to nearby OpenStreetMap road/rail network linework.
+A Streamlit MVP for snapping a user-drawn polygon to nearby OpenStreetMap road/rail linework.
 
-## What V3 fixes
+V4 is designed for polygon geometry, not routing. It does **not** obey one-way streets, pedestrian crossings, or walking rules. It builds closed road-network cells and returns a polygon boundary snapped to roads/rails.
 
-V1 snapped points independently and connected them with straight lines. That created fake diagonal shortcuts.
+## What V4 fixes
 
-V2 used actual OSM linework and avoided fake diagonals, but it could return broken pieces because it did not care whether the selected roads could form a loop.
+Compared with earlier versions:
 
-V3 prioritizes a connected closed loop:
-
-1. Sample the drawn polygon boundary into control points.
-2. Find several nearby OSM road/rail graph nodes for every control point.
-3. Use a cyclic dynamic program to choose nodes that are close to the boundary and can connect back to the start.
-4. Route between those chosen nodes along the OSM network.
-5. Return real road/rail geometry as GeoJSON.
-
-This means the output can move inward or outward from the drawn polygon if a nearby road forms a better closed loop.
+- Prioritizes a closed polygon, not a shortest human path.
+- Prunes dead-end branches so red lines do not poke out into nowhere.
+- Excludes pedestrian paths, crossings, tracks, cycleways, and footways by default.
+- Excludes service roads by default.
+- Lets you switch to main roads only if you want to ignore smaller side streets.
+- Simplifies the output so the snapped polygon has fewer coordinate points.
 
 ## Files
 
@@ -28,7 +25,7 @@ README.md
 .gitignore
 ```
 
-## Local run
+## Local setup
 
 ```bash
 python -m venv .venv
@@ -37,7 +34,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-On Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
 python -m venv .venv
@@ -46,46 +43,60 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy on Streamlit Community Cloud
+## Streamlit Cloud deployment
 
 1. Push these files to GitHub.
-2. Create a new Streamlit app.
-3. Select your GitHub repo.
-4. Set the main file path to `app.py`.
+2. Go to Streamlit Community Cloud.
+3. Create a new app from the repo.
+4. Use `app.py` as the main file.
 5. Deploy.
 
-## Recommended starting settings
+## Recommended settings
 
-For dense city blocks:
+For clean polygons:
 
-- Snap to: Roads only
-- Search buffer: 250-400m
-- Loop control-point spacing: 50-80m
-- Max candidate distance: 150-250m
-- Nearby candidates per control point: 5-7
-- Boundary closeness weight: 5-8
-- Max control points: 60-80
+```text
+Snap to: Roads only
+Road tier: Public streets, no service roads or paths
+Search buffer: 300 m
+Cell inclusion threshold: 20%
+Ignore tiny cells below: 500 m²
+Simplify output tolerance: 8 m
+Keep largest component: on
+Prune dead-end branches: on
+```
 
-## Tuning guide
+If the polygon still includes too many side roads:
 
-If the result does not close:
+```text
+Road tier: Main roads only
+```
 
-- Increase search buffer.
-- Increase max candidate distance.
-- Increase nearby candidates per control point.
-- Use Roads only instead of Roads + rail.
+If the polygon becomes too coarse or cannot find cells:
 
-If the result closes but drifts too far from the drawn polygon:
+```text
+Road tier: Public streets, no service roads or paths
+Increase search buffer
+Lower cell inclusion threshold
+Lower ignore tiny cells threshold
+```
 
-- Increase boundary closeness weight.
-- Lower loop control-point spacing.
+## How it works
 
-If the result is slow:
+1. The user draws a polygon.
+2. The app queries nearby OpenStreetMap roads/rails.
+3. It filters the network to the selected road tier.
+4. It converts the network into undirected linework.
+5. It prunes dead-end branches.
+6. It polygonizes the remaining road/rail linework into closed cells.
+7. It selects cells that overlap the drawn polygon.
+8. It dissolves selected cells into one snapped polygon.
+9. It simplifies the output to reduce coordinate count.
+10. It returns GeoJSON.
 
-- Increase loop control-point spacing.
-- Lower max control points.
-- Use Roads only.
+## Limitations
 
-## Important note
-
-A closed road network loop may not exist near every drawn polygon. When the app cannot find a fully closed connected loop, it returns the best connected open sequence and displays a warning.
+- This uses road/rail centerlines, not curb or parcel boundaries.
+- If roads do not form closed cells in the selected area, the app may fail or return a simpler nearby component.
+- Rail lines may create unexpected cells when mixed with roads.
+- Live OSM/Overpass queries can be slow for very large polygons. For production, use local OSM data with PostGIS/pgRouting or a tiled/network service.

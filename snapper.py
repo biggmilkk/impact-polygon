@@ -8,23 +8,80 @@ import networkx as nx
 import numpy as np
 import osmnx as ox
 from shapely.geometry import LineString, MultiLineString, Point, Polygon, mapping, shape
-from shapely.ops import linemerge, unary_union
+from shapely.ops import linemerge, polygonize, unary_union
 
 SnapTarget = Literal["roads", "rails", "roads_and_rails"]
+RoadTier = Literal["main", "public", "all_drivable"]
+
+ROAD_TIERS: dict[RoadTier, set[str]] = {
+    # Use this when you want to ignore small side streets as much as possible.
+    "main": {
+        "motorway",
+        "trunk",
+        "primary",
+        "secondary",
+        "tertiary",
+        "motorway_link",
+        "trunk_link",
+        "primary_link",
+        "secondary_link",
+        "tertiary_link",
+    },
+    # Recommended default. Keeps normal public streets but excludes footways, pedestrian paths,
+    # tracks, crossings, and small service roads such as driveways and car-park aisles.
+    "public": {
+        "motorway",
+        "trunk",
+        "primary",
+        "secondary",
+        "tertiary",
+        "unclassified",
+        "residential",
+        "living_street",
+        "road",
+        "motorway_link",
+        "trunk_link",
+        "primary_link",
+        "secondary_link",
+        "tertiary_link",
+    },
+    # Use only when the snapped polygon needs private/service access roads too.
+    "all_drivable": {
+        "motorway",
+        "trunk",
+        "primary",
+        "secondary",
+        "tertiary",
+        "unclassified",
+        "residential",
+        "living_street",
+        "road",
+        "service",
+        "motorway_link",
+        "trunk_link",
+        "primary_link",
+        "secondary_link",
+        "tertiary_link",
+    },
+}
+
+RAIL_VALUES = {"rail", "light_rail", "subway", "tram", "narrow_gauge", "monorail"}
 
 
 @dataclass
 class SnapResult:
-    snapped_line_geojson: dict[str, Any]
+    snapped_geojson: dict[str, Any]
+    snapped_boundary_geojson: dict[str, Any]
     original_polygon_geojson: dict[str, Any]
     query_area_geojson: dict[str, Any]
+    algorithm: str
     network_nodes_count: int
     network_edges_count: int
-    control_points_count: int
-    mean_snap_distance_m: float
-    max_snap_distance_m: float
-    output_length_m: float
-    route_piece_count: int
+    candidate_cells_count: int
+    selected_cells_count: int
+    output_area_m2: float
+    output_perimeter_m: float
+    coordinate_count: int
     closed_loop: bool
     warning: str | None = None
 
@@ -35,7 +92,7 @@ def _ensure_polygon_from_geojson(geojson: dict[str, Any]) -> Polygon:
     geom = shape(geometry)
 
     if geom.geom_type != "Polygon":
-        raise ValueError("Please draw a Polygon, not a LineString, Point, or Rectangle layer object.")
+        raise ValueError("Please draw one Polygon. Rectangles are fine if the drawing tool returns them as Polygon GeoJSON.")
 
     if not geom.is_valid:
         geom = geom.buffer(0)
@@ -54,16 +111,19 @@ def _buffer_polygon_meters(polygon: Polygon, buffer_m: float) -> Polygon:
     """Create a WGS84 query buffer using a local metric projection."""
     polygon_wgs84 = _polygon_gdf(polygon)
     polygon_projected = ox.projection.project_gdf(polygon_wgs84)
-    buffered_projected = polygon_projected.geometry.iloc[0].buffer(buffer_m)
+    buffered_projected = polygon_projected.geometry.iloc[0].buffer(float(buffer_m))
     buffered_wgs84 = gpd.GeoDataFrame(geometry=[buffered_projected], crs=polygon_projected.crs).to_crs(
         "EPSG:4326"
     )
     return buffered_wgs84.geometry.iloc[0]
 
 
-def _custom_filter_for_target(target: SnapTarget) -> str | list[str]:
-    road_filter = '["highway"]'
-    rail_filter = '["railway"~"rail|light_rail|subway|tram|narrow_gauge"]'
+def _custom_filter_for_target(target: SnapTarget, road_tier: RoadTier) -> str | list[str]:
+    road_values = "|".join(sorted(ROAD_TIERS[road_tier]))
+    rail_values = "|".join(sorted(RAIL_VALUES))
+
+    road_filter = f'["highway"~"{road_values}"]'
+    rail_filter = f'["railway"~"{rail_values}"]'
 
     if target == "roads":
         return road_filter
@@ -72,326 +132,216 @@ def _custom_filter_for_target(target: SnapTarget) -> str | list[str]:
     return [road_filter, rail_filter]
 
 
-def _to_undirected_graph(graph: nx.MultiDiGraph) -> nx.MultiGraph:
-    """
-    Convert to undirected for snapping.
+def _tag_values(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        return {str(item) for item in value if item is not None}
+    return {str(value)}
 
-    For this use case, the red outline is visual linework. It should not obey one-way streets.
-    """
+
+def _edge_is_allowed(attrs: dict[str, Any], target: SnapTarget, road_tier: RoadTier) -> bool:
+    highway_values = _tag_values(attrs.get("highway"))
+    railway_values = _tag_values(attrs.get("railway"))
+
+    is_allowed_road = bool(highway_values & ROAD_TIERS[road_tier])
+    is_allowed_rail = bool(railway_values & RAIL_VALUES)
+
+    if target == "roads":
+        return is_allowed_road
+    if target == "rails":
+        return is_allowed_rail
+    return is_allowed_road or is_allowed_rail
+
+
+def _to_undirected_graph(graph: nx.MultiDiGraph | nx.MultiGraph) -> nx.MultiGraph:
+    """Convert to undirected because this is polygon linework, not human navigation."""
     try:
         return ox.convert.to_undirected(graph)
     except Exception:
         return graph.to_undirected()
 
 
-def _densify_line(line: LineString, spacing_m: float) -> list[Point]:
-    """Sample points along a projected polygon boundary, excluding the duplicate closing point."""
-    if line.length <= 0:
-        return []
+def _filter_graph_edges(
+    graph: nx.MultiDiGraph | nx.MultiGraph,
+    target: SnapTarget,
+    road_tier: RoadTier,
+) -> nx.MultiDiGraph | nx.MultiGraph:
+    filtered = graph.copy()
 
-    spacing_m = max(float(spacing_m), 1.0)
-    distances = list(np.arange(0, line.length, spacing_m))
-    if len(distances) < 4:
-        distances = list(np.linspace(0, line.length, 5)[:-1])
-
-    return [line.interpolate(distance) for distance in distances]
-
-
-def _downsample_points(points: list[Point], max_points: int) -> tuple[list[Point], bool]:
-    """Limit control points so cyclic routing stays fast on Streamlit Cloud."""
-    if len(points) <= max_points:
-        return points, False
-
-    idx = np.linspace(0, len(points) - 1, max_points).round().astype(int)
-    idx = sorted(set(int(i) for i in idx))
-    return [points[i] for i in idx], True
-
-
-def _candidate_nodes_for_point(
-    point: Point,
-    nodes: gpd.GeoDataFrame,
-    candidate_count: int,
-    max_snap_distance_m: float | None,
-) -> tuple[list[dict[str, Any]], bool]:
-    """
-    Find nearest graph nodes for a control point.
-
-    Returns candidates and whether all candidates were beyond max_snap_distance_m.
-    """
-    distances = nodes.geometry.distance(point)
-    nearest = distances.nsmallest(max(1, int(candidate_count)))
-
-    candidates: list[dict[str, Any]] = []
-    for node_id, distance_m in nearest.items():
-        distance_value = float(distance_m)
-        if max_snap_distance_m is None or distance_value <= max_snap_distance_m:
-            candidates.append({"node": node_id, "distance_m": distance_value})
-
-    if candidates:
-        return candidates, False
-
-    # Soft fallback: keep the nearest candidate, but warn the user. Without this, one bad
-    # point can make the whole loop impossible.
-    node_id = nearest.index[0]
-    return [{"node": node_id, "distance_m": float(nearest.iloc[0])}], True
-
-
-def _shortest_path_length_cached(
-    graph: nx.Graph,
-    source: Any,
-    target: Any,
-    cache: dict[tuple[Any, Any], float],
-) -> float:
-    if source == target:
-        return 0.0
-
-    key = (source, target) if str(source) <= str(target) else (target, source)
-    if key in cache:
-        return cache[key]
-
-    try:
-        length = float(nx.shortest_path_length(graph, source=source, target=target, weight="length"))
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        length = float("inf")
-
-    cache[key] = length
-    return length
-
-
-def _shortest_path_nodes(graph: nx.Graph, source: Any, target: Any) -> list[Any]:
-    if source == target:
-        return [source]
-    return nx.shortest_path(graph, source=source, target=target, weight="length")
-
-
-def _select_closed_node_sequence(
-    graph: nx.Graph,
-    candidates_by_point: list[list[dict[str, Any]]],
-    boundary_closeness_weight: float,
-) -> tuple[list[Any], float, float, bool]:
-    """
-    Choose one candidate node per polygon control point.
-
-    This is a cyclic dynamic program. It tries all possible first candidates, walks around
-    the boundary, then adds the cost of closing the last candidate back to the first.
-
-    Score = network route length + boundary_closeness_weight * snap distance
-    """
-    if len(candidates_by_point) < 3:
-        raise ValueError("Not enough control points to build a loop.")
-
-    length_cache: dict[tuple[Any, Any], float] = {}
-    best_score = float("inf")
-    best_nodes: list[Any] = []
-    best_snap_sum = float("inf")
-    best_route_length = float("inf")
-    closed = False
-
-    first_candidates = candidates_by_point[0]
-
-    for first_candidate in first_candidates:
-        first_node = first_candidate["node"]
-        first_snap = float(first_candidate["distance_m"])
-
-        # State value: node -> (score_so_far, selected_nodes, snap_sum, route_length_sum)
-        states: dict[Any, tuple[float, list[Any], float, float]] = {
-            first_node: (
-                boundary_closeness_weight * first_snap,
-                [first_node],
-                first_snap,
-                0.0,
-            )
-        }
-
-        for point_index in range(1, len(candidates_by_point)):
-            next_states: dict[Any, tuple[float, list[Any], float, float]] = {}
-
-            for prev_node, (prev_score, prev_path, prev_snap_sum, prev_route_sum) in states.items():
-                for candidate in candidates_by_point[point_index]:
-                    node = candidate["node"]
-                    snap_distance = float(candidate["distance_m"])
-                    transition_length = _shortest_path_length_cached(
-                        graph, prev_node, node, length_cache
-                    )
-                    if not np.isfinite(transition_length):
-                        continue
-
-                    score = prev_score + transition_length + boundary_closeness_weight * snap_distance
-                    snap_sum = prev_snap_sum + snap_distance
-                    route_sum = prev_route_sum + transition_length
-                    path = prev_path + [node]
-
-                    current_best = next_states.get(node)
-                    if current_best is None or score < current_best[0]:
-                        next_states[node] = (score, path, snap_sum, route_sum)
-
-            if not next_states:
-                break
-            states = next_states
-
-        if not states:
-            continue
-
-        for last_node, (score, path, snap_sum, route_sum) in states.items():
-            close_length = _shortest_path_length_cached(graph, last_node, first_node, length_cache)
-            if not np.isfinite(close_length):
-                continue
-
-            total_score = score + close_length
-            total_route_length = route_sum + close_length
-
-            if total_score < best_score:
-                best_score = total_score
-                best_nodes = path
-                best_snap_sum = snap_sum
-                best_route_length = total_route_length
-                closed = True
-
-    if not best_nodes:
-        # Fallback: greedy nearest connected path. This is not ideal, but it gives a useful
-        # error path if the network is fragmented.
-        greedy_nodes = [candidates_by_point[0][0]["node"]]
-        snap_sum = float(candidates_by_point[0][0]["distance_m"])
-        route_sum = 0.0
-        for candidates in candidates_by_point[1:]:
-            prev = greedy_nodes[-1]
-            best_candidate = None
-            best_cost = float("inf")
-            for candidate in candidates:
-                node = candidate["node"]
-                length = _shortest_path_length_cached(graph, prev, node, length_cache)
-                cost = length + boundary_closeness_weight * float(candidate["distance_m"])
-                if np.isfinite(cost) and cost < best_cost:
-                    best_cost = cost
-                    best_candidate = (node, float(candidate["distance_m"]), length)
-            if best_candidate is None:
-                continue
-            greedy_nodes.append(best_candidate[0])
-            snap_sum += best_candidate[1]
-            route_sum += best_candidate[2]
-
-        if len(greedy_nodes) < 2:
-            raise ValueError(
-                "Could not find a connected road/rail sequence. Try roads only, a larger search buffer, "
-                "or a larger max snap distance."
-            )
-
-        return greedy_nodes, snap_sum, route_sum, False
-
-    return best_nodes, best_snap_sum, best_route_length, closed
-
-
-def _edge_geometry_between(graph: nx.Graph, nodes: gpd.GeoDataFrame, u: Any, v: Any) -> LineString | None:
-    if u == v:
-        return None
-
-    edge_data = graph.get_edge_data(u, v)
-    if edge_data is None:
-        return None
-
-    # MultiGraph edge data is usually {key: attrs}. Simple Graph edge data is attrs.
-    if isinstance(edge_data, dict) and edge_data and all(isinstance(value, dict) for value in edge_data.values()):
-        attrs = min(edge_data.values(), key=lambda item: float(item.get("length", 0.0)))
+    if isinstance(filtered, (nx.MultiGraph, nx.MultiDiGraph)):
+        to_remove = [
+            (u, v, k)
+            for u, v, k, attrs in filtered.edges(keys=True, data=True)
+            if not _edge_is_allowed(attrs, target=target, road_tier=road_tier)
+        ]
+        filtered.remove_edges_from(to_remove)
     else:
-        attrs = edge_data
+        to_remove = [
+            (u, v)
+            for u, v, attrs in filtered.edges(data=True)
+            if not _edge_is_allowed(attrs, target=target, road_tier=road_tier)
+        ]
+        filtered.remove_edges_from(to_remove)
 
-    geometry = attrs.get("geometry") if isinstance(attrs, dict) else None
-    if geometry is not None and not geometry.is_empty:
-        if geometry.geom_type == "LineString":
-            return geometry
-        if geometry.geom_type == "MultiLineString":
-            try:
-                merged = linemerge(geometry)
-                if merged.geom_type == "LineString":
-                    return merged
-            except Exception:
-                pass
-
-    try:
-        return LineString([nodes.loc[u].geometry, nodes.loc[v].geometry])
-    except Exception:
-        return None
+    filtered.remove_nodes_from(list(nx.isolates(filtered)))
+    return filtered
 
 
-def _route_node_sequence_to_linework(
-    graph: nx.Graph,
-    nodes: gpd.GeoDataFrame,
-    selected_nodes: list[Any],
-    close_loop: bool,
-) -> tuple[LineString | MultiLineString, int]:
-    """Convert selected control nodes into actual shortest-path road/rail linework."""
-    if len(selected_nodes) < 2:
-        raise ValueError("The selected route has fewer than two nodes.")
+def _prune_dead_ends(graph: nx.MultiGraph) -> nx.MultiGraph:
+    """
+    Remove dangling branches so the output behaves like a polygon boundary, not a route.
 
-    ordered_pairs = list(zip(selected_nodes[:-1], selected_nodes[1:]))
-    if close_loop:
-        ordered_pairs.append((selected_nodes[-1], selected_nodes[0]))
+    This is the main fix for red lines that poke out and go nowhere. We repeatedly remove
+    degree-0 and degree-1 nodes. What remains is the cyclic/core part of the network.
+    """
+    pruned = graph.copy()
 
-    route_lines: list[LineString] = []
+    while True:
+        leaves = [node for node, degree in pruned.degree() if degree <= 1]
+        if not leaves:
+            break
+        pruned.remove_nodes_from(leaves)
 
-    for source, target in ordered_pairs:
-        if source == target:
+    # If pruning destroyed the graph, fall back to the original network instead of failing.
+    if pruned.number_of_edges() == 0:
+        return graph
+    return pruned
+
+
+def _line_geometries_from_edges(edges: gpd.GeoDataFrame) -> list[LineString]:
+    lines: list[LineString] = []
+    for geom in edges.geometry:
+        if geom is None or geom.is_empty:
             continue
-        try:
-            route_nodes = _shortest_path_nodes(graph, source, target)
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            continue
+        if geom.geom_type == "LineString":
+            lines.append(geom)
+        elif geom.geom_type == "MultiLineString":
+            lines.extend([part for part in geom.geoms if not part.is_empty and part.length > 0])
+    return lines
 
-        for u, v in zip(route_nodes[:-1], route_nodes[1:]):
-            geom = _edge_geometry_between(graph, nodes, u, v)
-            if geom is not None and not geom.is_empty and geom.length > 0:
-                route_lines.append(geom)
 
-    if not route_lines:
+def _largest_polygon_component(geom: Any) -> tuple[Any, bool]:
+    if geom.geom_type == "MultiPolygon":
+        parts = [part for part in geom.geoms if not part.is_empty]
+        if not parts:
+            return geom, False
+        return max(parts, key=lambda part: part.area), True
+    return geom, False
+
+
+def _count_coordinates(geom: Any) -> int:
+    if geom.is_empty:
+        return 0
+    if geom.geom_type == "Point":
+        return 1
+    if geom.geom_type in {"LineString", "LinearRing"}:
+        return len(geom.coords)
+    if geom.geom_type == "Polygon":
+        return len(geom.exterior.coords) + sum(len(ring.coords) for ring in geom.interiors)
+    if hasattr(geom, "geoms"):
+        return sum(_count_coordinates(part) for part in geom.geoms)
+    return 0
+
+
+def _build_cell_polygon(
+    edges_projected: gpd.GeoDataFrame,
+    drawn_polygon_projected: Polygon,
+    min_cell_overlap: float,
+    min_cell_area_m2: float,
+    simplify_tolerance_m: float,
+    keep_largest_component: bool,
+) -> tuple[Any, dict[str, Any]]:
+    """
+    Convert road/rail linework into closed cells, select cells that overlap the drawn polygon,
+    then dissolve them into one snapped polygon.
+
+    This treats the road network like a set of polygon boundaries. It does not compute a
+    pedestrian/driving path and it does not connect points with diagonal shortcuts.
+    """
+    lines = _line_geometries_from_edges(edges_projected)
+    if not lines:
+        raise ValueError("No usable road/rail line geometry was found after filtering.")
+
+    noded_linework = unary_union(lines)
+    cells = [cell for cell in polygonize(noded_linework) if cell.area >= float(min_cell_area_m2)]
+
+    if not cells:
         raise ValueError(
-            "No road/rail linework was produced. Try a larger search buffer or larger max snap distance."
+            "The selected road/rail network did not form any closed cells. Try Public streets instead of Main roads only, "
+            "or increase the search buffer."
         )
 
-    # Dissolve duplicate edges and merge connected pieces. This usually becomes a closed LineString.
-    dissolved = unary_union(route_lines)
-    try:
-        merged = linemerge(dissolved)
-    except Exception:
-        merged = dissolved
+    selected_cells = []
+    drawn_area = max(drawn_polygon_projected.area, 1.0)
 
-    if merged.geom_type == "LineString":
-        return merged, len(route_lines)
-    if merged.geom_type == "MultiLineString":
-        return merged, len(route_lines)
+    for cell in cells:
+        if not cell.intersects(drawn_polygon_projected):
+            continue
 
-    # GeometryCollection fallback.
-    pieces = [geom for geom in getattr(merged, "geoms", []) if geom.geom_type == "LineString"]
-    if pieces:
-        return MultiLineString(pieces), len(route_lines)
+        intersection_area = cell.intersection(drawn_polygon_projected).area
+        cell_overlap = intersection_area / max(cell.area, 1.0)
+        drawn_overlap = intersection_area / drawn_area
+        cell_center_inside = cell.representative_point().within(drawn_polygon_projected)
 
-    return MultiLineString(route_lines), len(route_lines)
+        if cell_center_inside or cell_overlap >= float(min_cell_overlap) or drawn_overlap >= 0.01:
+            selected_cells.append(cell)
+
+    if not selected_cells:
+        # Last-resort fallback: choose the road cell whose boundary is nearest to the drawn polygon boundary.
+        selected_cells = [
+            min(cells, key=lambda cell: cell.boundary.distance(drawn_polygon_projected.boundary))
+        ]
+
+    dissolved = unary_union(selected_cells)
+
+    reduced_to_largest = False
+    if keep_largest_component:
+        dissolved, reduced_to_largest = _largest_polygon_component(dissolved)
+
+    if simplify_tolerance_m > 0:
+        dissolved = dissolved.simplify(float(simplify_tolerance_m), preserve_topology=True)
+
+    if not dissolved.is_valid:
+        dissolved = dissolved.buffer(0)
+
+    if dissolved.is_empty:
+        raise ValueError("The snapped polygon became empty after dissolve/simplification. Try a lower simplify tolerance.")
+
+    meta = {
+        "candidate_cells_count": len(cells),
+        "selected_cells_count": len(selected_cells),
+        "reduced_to_largest": reduced_to_largest,
+    }
+    return dissolved, meta
 
 
-def snap_polygon_to_closed_network_loop(
+def snap_polygon_to_road_rail_polygon(
     drawn_geojson: dict[str, Any],
     target: SnapTarget = "roads",
+    road_tier: RoadTier = "public",
     search_buffer_m: float = 250,
-    control_spacing_m: float = 60,
-    max_snap_distance_m: float | None = 150,
-    candidate_count: int = 5,
-    boundary_closeness_weight: float = 6,
-    max_control_points: int = 70,
+    min_cell_overlap: float = 0.20,
+    min_cell_area_m2: float = 500,
+    simplify_tolerance_m: float = 8,
+    keep_largest_component: bool = True,
+    prune_dead_ends: bool = True,
 ) -> SnapResult:
     """
-    Snap a user-drawn polygon boundary to a nearby connected road/rail loop.
+    Snap a drawn polygon to nearby road/rail linework by creating closed road-network cells.
 
-    V3 behavior:
-    - Samples the polygon boundary into control points.
-    - Finds several nearby road/rail graph nodes for each control point.
-    - Chooses a sequence that is both close to the boundary and can close back to the start.
-    - Routes between chosen nodes along the OSM network, so the output uses real linework.
-
-    This is closer to lightweight map matching than simple nearest-line snapping.
+    V4 behavior:
+    - Direction does not matter: the graph is undirected.
+    - Pedestrian paths/crossings are excluded by default.
+    - Service roads are excluded by default.
+    - Dead-end branches are pruned so the red output does not poke out into nowhere.
+    - The output is a closed polygon/multipolygon boundary, not a human route.
+    - Output coordinates can be simplified so the result has fewer points.
     """
     polygon = _ensure_polygon_from_geojson(drawn_geojson)
     query_polygon_wgs84 = _buffer_polygon_meters(polygon, buffer_m=search_buffer_m)
 
-    custom_filter = _custom_filter_for_target(target)
+    custom_filter = _custom_filter_for_target(target=target, road_tier=road_tier)
     graph = ox.graph_from_polygon(
         query_polygon_wgs84,
         network_type="all",
@@ -403,85 +353,66 @@ def snap_polygon_to_closed_network_loop(
 
     if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
         raise ValueError(
-            "No road/rail network was found near this polygon. Try increasing the search buffer."
+            "No matching roads/rails were found near this polygon. Try increasing the search buffer or lowering the road tier."
+        )
+
+    graph = _filter_graph_edges(graph, target=target, road_tier=road_tier)
+    if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
+        raise ValueError(
+            "All downloaded network edges were filtered out. Try Public streets or All drivable roads."
         )
 
     graph_projected = ox.project_graph(graph)
-    graph_route = _to_undirected_graph(graph_projected)
-    nodes_projected, edges_projected = ox.graph_to_gdfs(graph_route, nodes=True, edges=True)
+    graph_undirected = _to_undirected_graph(graph_projected)
+    if prune_dead_ends:
+        graph_undirected = _prune_dead_ends(graph_undirected)
 
-    polygon_projected = _polygon_gdf(polygon).to_crs(nodes_projected.crs)
-    boundary_projected = polygon_projected.geometry.iloc[0].boundary
+    nodes_projected, edges_projected = ox.graph_to_gdfs(graph_undirected, nodes=True, edges=True)
+    polygon_projected = _polygon_gdf(polygon).to_crs(nodes_projected.crs).geometry.iloc[0]
 
-    control_points = _densify_line(boundary_projected, spacing_m=control_spacing_m)
-    control_points, was_downsampled = _downsample_points(control_points, max_control_points)
-
-    if len(control_points) < 4:
-        raise ValueError(
-            "The polygon is too small to form a useful loop. Try drawing a larger polygon or lowering control spacing."
-        )
-
-    candidates_by_point: list[list[dict[str, Any]]] = []
-    soft_fallback_count = 0
-    all_candidate_distances: list[float] = []
-
-    for point in control_points:
-        candidates, used_soft_fallback = _candidate_nodes_for_point(
-            point=point,
-            nodes=nodes_projected,
-            candidate_count=candidate_count,
-            max_snap_distance_m=max_snap_distance_m,
-        )
-        candidates_by_point.append(candidates)
-        soft_fallback_count += int(used_soft_fallback)
-        all_candidate_distances.append(float(candidates[0]["distance_m"]))
-
-    selected_nodes, snap_sum, route_length, closed = _select_closed_node_sequence(
-        graph=graph_route,
-        candidates_by_point=candidates_by_point,
-        boundary_closeness_weight=boundary_closeness_weight,
+    snapped_projected, meta = _build_cell_polygon(
+        edges_projected=edges_projected,
+        drawn_polygon_projected=polygon_projected,
+        min_cell_overlap=min_cell_overlap,
+        min_cell_area_m2=min_cell_area_m2,
+        simplify_tolerance_m=simplify_tolerance_m,
+        keep_largest_component=keep_largest_component,
     )
 
-    snapped_projected, route_piece_count = _route_node_sequence_to_linework(
-        graph=graph_route,
-        nodes=nodes_projected,
-        selected_nodes=selected_nodes,
-        close_loop=closed,
-    )
+    boundary_projected = snapped_projected.boundary
 
     snapped_wgs84 = gpd.GeoDataFrame(geometry=[snapped_projected], crs=nodes_projected.crs).to_crs(
         "EPSG:4326"
     ).geometry.iloc[0]
+    boundary_wgs84 = gpd.GeoDataFrame(geometry=[boundary_projected], crs=nodes_projected.crs).to_crs(
+        "EPSG:4326"
+    ).geometry.iloc[0]
 
     warning_parts: list[str] = []
-    if was_downsampled:
+    if meta.get("reduced_to_largest"):
         warning_parts.append(
-            f"Control points were downsampled to {len(control_points)} for performance. Increase max control points for more detail."
+            "The selected road cells formed multiple disconnected polygons, so only the largest closed component was kept."
         )
-    if soft_fallback_count:
+    if snapped_projected.geom_type == "MultiPolygon":
+        warning_parts.append("Output is a MultiPolygon. Enable 'keep largest component' for one loop only.")
+    if target != "roads":
         warning_parts.append(
-            f"{soft_fallback_count} control point(s) had no candidate within max snap distance, so the nearest node was used anyway."
-        )
-    if not closed:
-        warning_parts.append(
-            "A fully closed network loop was not found, so the app returned the best connected open sequence."
-        )
-    if snapped_projected.geom_type == "MultiLineString":
-        warning_parts.append(
-            "Output is a MultiLineString. This can happen when the chosen loop reuses edges or the network has tiny disconnected geometry pieces."
+            "Road+rail or rail-only snapping can create unusual cells where rail lines cross roads. Roads only is usually cleaner."
         )
 
     return SnapResult(
-        snapped_line_geojson=mapping(snapped_wgs84),
+        snapped_geojson=mapping(snapped_wgs84),
+        snapped_boundary_geojson=mapping(boundary_wgs84),
         original_polygon_geojson=mapping(polygon),
         query_area_geojson=mapping(query_polygon_wgs84),
-        network_nodes_count=int(graph_route.number_of_nodes()),
-        network_edges_count=int(graph_route.number_of_edges()),
-        control_points_count=int(len(control_points)),
-        mean_snap_distance_m=float(snap_sum / max(1, len(selected_nodes))),
-        max_snap_distance_m=float(max(all_candidate_distances) if all_candidate_distances else 0.0),
-        output_length_m=float(route_length),
-        route_piece_count=int(route_piece_count),
-        closed_loop=bool(closed),
+        algorithm="cell_polygonizer_v4",
+        network_nodes_count=int(graph_undirected.number_of_nodes()),
+        network_edges_count=int(graph_undirected.number_of_edges()),
+        candidate_cells_count=int(meta["candidate_cells_count"]),
+        selected_cells_count=int(meta["selected_cells_count"]),
+        output_area_m2=float(snapped_projected.area),
+        output_perimeter_m=float(snapped_projected.length),
+        coordinate_count=int(_count_coordinates(snapped_projected)),
+        closed_loop=snapped_projected.geom_type in {"Polygon", "MultiPolygon"},
         warning=" ".join(warning_parts) if warning_parts else None,
     )
