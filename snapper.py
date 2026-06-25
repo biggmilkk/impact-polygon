@@ -102,6 +102,8 @@ class SnapResult:
     coverage_ratio: float
     outside_ratio: float
     missing_ratio: float
+    holes_removed_count: int
+    holes_removed_area_m2: float
     warning: str | None = None
 
 
@@ -288,6 +290,65 @@ def _polygon_parts(geom: Any) -> list[Polygon]:
     if geom.geom_type == "MultiPolygon":
         return [part for part in geom.geoms if not part.is_empty and part.area > 0]
     return []
+
+
+def _count_interior_rings(geom: Any) -> int:
+    """Count interior rings/holes in a Polygon or MultiPolygon."""
+    if geom.is_empty:
+        return 0
+    if geom.geom_type == "Polygon":
+        return len(geom.interiors)
+    if geom.geom_type == "MultiPolygon":
+        return sum(len(part.interiors) for part in geom.geoms)
+    return 0
+
+
+def _interior_ring_area_m2(geom: Any) -> float:
+    """Area represented by polygon holes. Assumes the geometry CRS is projected in meters."""
+    if geom.is_empty:
+        return 0.0
+    if geom.geom_type == "Polygon":
+        return float(sum(Polygon(ring).area for ring in geom.interiors))
+    if geom.geom_type == "MultiPolygon":
+        return float(sum(_interior_ring_area_m2(part) for part in geom.geoms))
+    return 0.0
+
+
+def _remove_polygon_holes(geom: Any) -> Any:
+    """Return a clean outer outline by filling all interior rings/holes.
+
+    For this app, the user wants a simple snapped boundary polygon, not internal
+    island outlines. Polygonized road cells can create tiny triangular holes where
+    interior streets form closed cells; those show up as unwanted red triangles.
+    """
+    if geom.is_empty:
+        return geom
+
+    if geom.geom_type == "Polygon":
+        if not geom.interiors:
+            return geom
+        cleaned = Polygon(geom.exterior)
+        if not cleaned.is_valid:
+            cleaned = cleaned.buffer(0)
+        return cleaned
+
+    if geom.geom_type == "MultiPolygon":
+        cleaned_parts = []
+        for part in geom.geoms:
+            if part.is_empty or part.area <= 0:
+                continue
+            cleaned = Polygon(part.exterior)
+            if not cleaned.is_valid:
+                cleaned = cleaned.buffer(0)
+            cleaned_parts.extend(_polygon_parts(cleaned))
+        if not cleaned_parts:
+            return Polygon()
+        cleaned_union = unary_union(cleaned_parts)
+        if not cleaned_union.is_valid:
+            cleaned_union = cleaned_union.buffer(0)
+        return cleaned_union
+
+    return geom
 
 
 def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dict[str, float]:
@@ -556,14 +617,32 @@ def _build_fitted_cell_polygon(
     )
 
     reduced_to_best = False
+    holes_removed_count = 0
+    holes_removed_area_m2 = 0.0
+
     fitted, reduced_to_best, score = _best_single_component(fitted, drawn_polygon_projected, fit_mode)
+
+    # V8: the product target is a simple outer polygon. Interior rings/holes
+    # are almost always visual artifacts from small road cells, so fill them.
+    holes_removed_count += _count_interior_rings(fitted)
+    holes_removed_area_m2 += _interior_ring_area_m2(fitted)
+    fitted = _remove_polygon_holes(fitted)
+    fitted, reduced_after_holes, score = _best_single_component(fitted, drawn_polygon_projected, fit_mode)
+    reduced_to_best = reduced_to_best or reduced_after_holes
+    score = _score_polygon(fitted, drawn_polygon_projected, fit_mode)
 
     if simplify_tolerance_m > 0:
         fitted = fitted.simplify(float(simplify_tolerance_m), preserve_topology=True)
         if not fitted.is_valid:
             fitted = fitted.buffer(0)
+
+        holes_removed_count += _count_interior_rings(fitted)
+        holes_removed_area_m2 += _interior_ring_area_m2(fitted)
+        fitted = _remove_polygon_holes(fitted)
+
         fitted, reduced_again, score = _best_single_component(fitted, drawn_polygon_projected, fit_mode)
         reduced_to_best = reduced_to_best or reduced_again
+        score = _score_polygon(fitted, drawn_polygon_projected, fit_mode)
 
     if fitted.is_empty:
         raise ValueError("The snapped polygon became empty after fitting. Try a lower simplify tolerance.")
@@ -577,6 +656,8 @@ def _build_fitted_cell_polygon(
         "outside_ratio": score["outside_ratio"],
         "missing_ratio": score["missing_ratio"],
         "boundary_distance_m": score["boundary_distance_m"],
+        "holes_removed_count": holes_removed_count,
+        "holes_removed_area_m2": holes_removed_area_m2,
         "removed_cells_count": removed,
         "added_cells_count": added,
         "reduced_to_best": reduced_to_best,
@@ -601,13 +682,14 @@ def snap_polygon_to_road_rail_polygon(
     """
     Snap a drawn polygon to a best-fitting closed road/rail cell polygon.
 
-    V5 behavior:
+    V8 behavior:
     - Direction is ignored: road graph is undirected.
     - Footways, pedestrian paths, crossings, cycleways, tracks, and steps are excluded.
     - Service roads are excluded unless road_tier='all_drivable'.
     - Dead-end branches are removed before polygonizing.
     - Whole closed cells are selected, then globally scored against the drawn polygon.
     - The final component is chosen by best fit, not largest area.
+    - Interior holes are filled so the user sees one clean outer polygon, not red triangles/islands.
     - Greedy refinement removes outside bulges and adds only cells that improve fit.
     """
     polygon = _ensure_polygon_from_geojson(drawn_geojson)
@@ -670,7 +752,7 @@ def snap_polygon_to_road_rail_polygon(
         snapped_boundary_geojson=mapping(boundary_wgs84),
         original_polygon_geojson=mapping(polygon),
         query_area_geojson=mapping(query_polygon_wgs84),
-        algorithm="best_fit_cell_polygonizer_v5",
+        algorithm="best_fit_cell_polygonizer_v8_hole_free_outline",
         network_nodes_count=int(graph_undirected.number_of_nodes()),
         network_edges_count=int(graph_undirected.number_of_edges()),
         candidate_cells_count=int(meta["candidate_cells_count"]),
@@ -684,5 +766,7 @@ def snap_polygon_to_road_rail_polygon(
         coverage_ratio=float(meta["coverage_ratio"]),
         outside_ratio=float(meta["outside_ratio"]),
         missing_ratio=float(meta["missing_ratio"]),
+        holes_removed_count=int(meta.get("holes_removed_count", 0)),
+        holes_removed_area_m2=float(meta.get("holes_removed_area_m2", 0.0)),
         warning=" ".join(warning_parts) if warning_parts else None,
     )

@@ -18,7 +18,7 @@ from streamlit_folium import st_folium
 from snapper import snap_polygon_to_road_rail_polygon
 
 
-APP_VERSION = "v7_simple_ux"
+APP_VERSION = "v8_hole_free_outline"
 
 
 st.set_page_config(
@@ -163,6 +163,8 @@ def _metrics_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "output_area_m2",
         "output_perimeter_m",
         "coordinate_count",
+        "holes_removed_count",
+        "holes_removed_area_m2",
         "closed_loop",
         "fit_score",
         "coverage_ratio",
@@ -290,11 +292,6 @@ def _build_debug_map_html(export_objects: dict[str, Any], settings_used: dict[st
         style_function=lambda _: {"color": "red", "weight": 4, "fillColor": "red", "fillOpacity": 0.08},
     ).add_to(debug_map)
 
-    folium.GeoJson(
-        export_objects["output_boundary_feature"],
-        name="Output boundary - red",
-        style_function=lambda _: {"color": "red", "weight": 5},
-    ).add_to(debug_map)
 
     settings_text = html.escape(json.dumps(settings_used, indent=2))
     metrics_text = html.escape(json.dumps(metrics, indent=2))
@@ -369,17 +366,17 @@ For now, your desired purple output can stay hand-drawn on the screenshot.
 
 
 def _clear_previous_result_if_needed(drawn_geojson_string: str, current_case_key: str) -> None:
-    previous_drawn_string = st.session_state.get("drawn_geojson_string_v7")
-    previous_case_key = st.session_state.get("snap_result_case_key_v7")
+    previous_drawn_string = st.session_state.get("drawn_geojson_string_v8")
+    previous_case_key = st.session_state.get("snap_result_case_key_v8")
     if previous_drawn_string and previous_drawn_string != drawn_geojson_string:
-        st.session_state.pop("snap_result_v7", None)
-        st.session_state.pop("snap_settings_v7", None)
-        st.session_state.pop("drawn_geojson_v7", None)
-        st.session_state.pop("snap_result_case_key_v7", None)
-        st.session_state.pop("snap_result_case_id_v7", None)
+        st.session_state.pop("snap_result_v8", None)
+        st.session_state.pop("snap_settings_v8", None)
+        st.session_state.pop("drawn_geojson_v8", None)
+        st.session_state.pop("snap_result_case_key_v8", None)
+        st.session_state.pop("snap_result_case_id_v8", None)
     elif previous_case_key and previous_case_key != current_case_key:
-        st.session_state.pop("snap_result_v7", None)
-    st.session_state["drawn_geojson_string_v7"] = drawn_geojson_string
+        st.session_state.pop("snap_result_v8", None)
+    st.session_state["drawn_geojson_string_v8"] = drawn_geojson_string
 
 
 st.markdown(
@@ -417,7 +414,7 @@ with left:
         height=650,
         width=None,
         returned_objects=["all_drawings", "last_active_drawing"],
-        key="draw_map_v7",
+        key="draw_map_v8",
     )
 
 with right:
@@ -489,25 +486,25 @@ with right:
                     simplify_tolerance_m=float(settings_now["simplify_tolerance_m"]),
                     max_refinement_iterations=int(settings_now["max_refinement_iterations"]),
                 )
-                st.session_state["snap_result_v7"] = result
-                st.session_state["snap_settings_v7"] = settings_now
-                st.session_state["drawn_geojson_v7"] = drawn
-                st.session_state["snap_result_case_key_v7"] = current_case_key
-                st.session_state["snap_result_case_id_v7"] = current_case_id
+                st.session_state["snap_result_v8"] = result
+                st.session_state["snap_settings_v8"] = settings_now
+                st.session_state["drawn_geojson_v8"] = drawn
+                st.session_state["snap_result_case_key_v8"] = current_case_key
+                st.session_state["snap_result_case_id_v8"] = current_case_id
             except Exception as exc:  # noqa: BLE001
                 st.error(str(exc))
                 st.stop()
 
-    result = st.session_state.get("snap_result_v7")
-    result_case_key = st.session_state.get("snap_result_case_key_v7")
+    result = st.session_state.get("snap_result_v8")
+    result_case_key = st.session_state.get("snap_result_case_key_v8")
 
     if result and result_case_key != current_case_key:
         st.info("The polygon or controls changed. Click **Snap polygon** again to update the red output.")
         result = None
 
     if result:
-        settings_used = st.session_state.get("snap_settings_v7", settings_now)
-        drawn_for_result = st.session_state.get("drawn_geojson_v7", drawn)
+        settings_used = st.session_state.get("snap_settings_v8", settings_now)
+        drawn_for_result = st.session_state.get("drawn_geojson_v8", drawn)
 
         if result.get("warning"):
             st.warning(result["warning"])
@@ -520,6 +517,8 @@ with right:
         c1.metric("Input covered", f"{result['coverage_ratio'] * 100:.0f}%")
         c2.metric("Outside bulge", f"{result['outside_ratio'] * 100:.0f}%")
         c3.metric("Points", result["coordinate_count"])
+        if result.get("holes_removed_count", 0):
+            st.caption(f"Cleaned {result['holes_removed_count']} internal hole(s) from the polygon boundary.")
 
         tips: list[str] = []
         if result["outside_ratio"] > 0.45:
@@ -544,7 +543,7 @@ with right:
             result=result,
             settings_used=settings_used,
             issue_notes=issue_notes,
-            case_id=st.session_state.get("snap_result_case_id_v7", current_case_id),
+            case_id=st.session_state.get("snap_result_case_id_v8", current_case_id),
         )
         metrics = _metrics_from_result(result)
         debug_map_html = _build_debug_map_html(export_objects, settings_used, metrics)
@@ -595,13 +594,13 @@ with right:
         st.write("Click **Snap polygon** after drawing your polygon.")
 
 
-result = st.session_state.get("snap_result_v7")
-result_case_key = st.session_state.get("snap_result_case_key_v7")
+result = st.session_state.get("snap_result_v8")
+result_case_key = st.session_state.get("snap_result_case_key_v8")
 
 if result and result_case_key == json.dumps(
     {
-        "drawn": st.session_state.get("drawn_geojson_v7"),
-        "settings": st.session_state.get("snap_settings_v7"),
+        "drawn": st.session_state.get("drawn_geojson_v8"),
+        "settings": st.session_state.get("snap_settings_v8"),
     },
     sort_keys=True,
 ):
@@ -609,10 +608,10 @@ if result and result_case_key == json.dumps(
     pass
 
 # Render preview based on the saved result, even if the user is about to change settings.
-result = st.session_state.get("snap_result_v7")
+result = st.session_state.get("snap_result_v8")
 if result:
-    drawn_for_result = st.session_state.get("drawn_geojson_v7")
-    settings_used = st.session_state.get("snap_settings_v7")
+    drawn_for_result = st.session_state.get("drawn_geojson_v8")
+    settings_used = st.session_state.get("snap_settings_v8")
     if drawn_for_result and settings_used:
         st.divider()
         st.subheader("Preview")
@@ -622,7 +621,7 @@ if result:
             result=result,
             settings_used=settings_used,
             issue_notes="",
-            case_id=st.session_state.get("snap_result_case_id_v7"),
+            case_id=st.session_state.get("snap_result_case_id_v8"),
         )
 
         minx, miny, maxx, maxy = _bounds_for_features(
@@ -641,11 +640,6 @@ if result:
             name="Snapped polygon - red",
             style_function=lambda _: {"color": "red", "weight": 4, "fillColor": "red", "fillOpacity": 0.08},
         ).add_to(preview)
-        folium.GeoJson(
-            export_objects["output_boundary_feature"],
-            name="Snapped boundary - red",
-            style_function=lambda _: {"color": "red", "weight": 5},
-        ).add_to(preview)
         folium.LayerControl().add_to(preview)
         preview.fit_bounds([[miny, minx], [maxy, maxx]])
-        st_folium(preview, height=520, width=None, key="preview_map_v7")
+        st_folium(preview, height=520, width=None, key="preview_map_v8")

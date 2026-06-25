@@ -1,8 +1,8 @@
-# Road Polygon Snapper V7
+# Road Polygon Snapper V8
 
 A simple Streamlit app for drawing a rough polygon and snapping it to nearby road/rail boundaries from OpenStreetMap.
 
-V7 focuses on a simple user experience:
+V8 focuses on a simple user experience and a cleaner polygon outline:
 
 - Only two main sliders:
   - **Fit**: tighter/smaller vs expanded/cover more
@@ -10,6 +10,7 @@ V7 focuses on a simple user experience:
 - Roads only by default
 - Pedestrian paths, footways, crossings, tracks, cycleways, and steps are excluded by the snapping engine
 - Service roads are not used unless the detail slider is pushed high enough to use smaller public streets; even then, service roads remain excluded
+- Internal polygon holes are filled by default so users do not see red island/triangle outlines
 - Debug export is hidden in an expander
 
 ## Files
