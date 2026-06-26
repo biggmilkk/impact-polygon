@@ -1,17 +1,25 @@
-# Road Polygon Snapper V8
+# Road Polygon Snapper V9
 
-A simple Streamlit app for drawing a rough polygon and snapping it to nearby road/rail boundaries from OpenStreetMap.
+A simple Streamlit prototype for drawing a rough polygon and snapping it to a clean road-bounded outline using OpenStreetMap data.
 
-V8 focuses on a simple user experience and a cleaner polygon outline:
+## What V9 changes
 
-- Only two main sliders:
-  - **Fit**: tighter/smaller vs expanded/cover more
-  - **Boundary detail**: smoother/fewer points vs sharper/smaller roads
-- Roads only by default
-- Pedestrian paths, footways, crossings, tracks, cycleways, and steps are excluded by the snapping engine
-- Service roads are not used unless the detail slider is pushed high enough to use smaller public streets; even then, service roads remain excluded
-- Internal polygon holes are filled by default so users do not see red island/triangle outlines
-- Debug export is hidden in an expander
+V9 fixes the "small output polygon" failure mode seen in dense city grids:
+
+- The app now defaults to a balanced Fit and normal public streets, while still excluding footways, crossings, cycleways, tracks, steps, and service roads.
+- The algorithm penalizes tiny polygons that cover only a small part of the input.
+- It tries multiple road-cell seed selections instead of getting stuck on the first neat closed cell.
+- It can automatically fall back from large/main roads to normal public streets when the larger-road network cannot form a good enclosing loop.
+- Interior holes are removed so the user sees one outer polygon boundary.
+
+## User controls
+
+The main interface exposes only two sliders:
+
+- **Fit**: left = tighter/smaller, right = expand/cover more of the drawn polygon.
+- **Boundary detail**: left = smoother/fewer points/larger roads, right = sharper/normal streets.
+
+Rail lines are optional and off by default.
 
 ## Files
 
@@ -32,7 +40,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Windows PowerShell:
+On Windows PowerShell:
 
 ```powershell
 python -m venv .venv
@@ -41,36 +49,20 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Streamlit Cloud
+## Deploy to Streamlit Community Cloud
 
-Deploy with:
+1. Push this folder to a GitHub repo.
+2. Create a new app in Streamlit Community Cloud.
+3. Select the repo and branch.
+4. Set the main file path to `app.py`.
+5. Deploy.
 
-- Main file path: `app.py`
-- Python dependencies: `requirements.txt`
+## Debugging bad cases
 
-## How to tune outputs
+After snapping, open **Export / debug files** and download the debug ZIP. Share that ZIP with a screenshot showing:
 
-Use only the two sliders first.
+- blue = input polygon
+- red = algorithm output
+- purple = desired output drawn manually on the screenshot
 
-- If the red polygon bulges too far outside the blue drawing, move **Fit** left.
-- If the red polygon misses too much of the blue drawing, move **Fit** right.
-- If the red polygon is too jagged or has too many points, move **Boundary detail** left.
-- If the red polygon cannot close or needs smaller streets, move **Boundary detail** right.
-- Turn on **Allow rail lines as boundaries** only when railway lines should count as valid polygon edges.
-
-## Debug bundle
-
-After snapping, open **Export / debug files** and download the debug ZIP. It includes:
-
-```text
-debug_bundle.json
-input_polygon.geojson
-snapped_output.geojson
-input_output_combined.geojson
-settings.json
-metrics.json
-debug_map.html
-README_DEBUG.txt
-```
-
-Share the ZIP with a screenshot if the output is bad.
+The debug ZIP contains the input GeoJSON, output GeoJSON, settings, metrics, and a standalone HTML map.

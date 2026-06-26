@@ -8,7 +8,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import osmnx as ox
-from shapely.geometry import LineString, MultiLineString, Polygon, mapping, shape
+from shapely.geometry import LineString, Polygon, mapping, shape
 from shapely.ops import polygonize, unary_union
 
 SnapTarget = Literal["roads", "rails", "roads_and_rails"]
@@ -18,7 +18,6 @@ FitMode = Literal["balanced", "tight", "cover"]
 # Deliberately exclude footway/path/pedestrian/crossing/cycleway/track/steps.
 # This app is drawing a road/rail polygon boundary, not a human route.
 ROAD_TIERS: dict[RoadTier, set[str]] = {
-    # Coarsest option. Good when small side streets make noisy boundaries.
     "arterial": {
         "motorway",
         "trunk",
@@ -29,7 +28,6 @@ ROAD_TIERS: dict[RoadTier, set[str]] = {
         "primary_link",
         "secondary_link",
     },
-    # Recommended for large urban polygons. Includes tertiary/collector roads.
     "main": {
         "motorway",
         "trunk",
@@ -42,7 +40,6 @@ ROAD_TIERS: dict[RoadTier, set[str]] = {
         "secondary_link",
         "tertiary_link",
     },
-    # Use when you need smaller public streets as valid polygon boundaries.
     "public": {
         "motorway",
         "trunk",
@@ -59,7 +56,6 @@ ROAD_TIERS: dict[RoadTier, set[str]] = {
         "secondary_link",
         "tertiary_link",
     },
-    # Usually too noisy for clean polygons, but useful for sites/campuses.
     "all_drivable": {
         "motorway",
         "trunk",
@@ -77,6 +73,13 @@ ROAD_TIERS: dict[RoadTier, set[str]] = {
         "secondary_link",
         "tertiary_link",
     },
+}
+
+ROAD_TIER_FALLBACKS: dict[RoadTier, list[RoadTier]] = {
+    "arterial": ["arterial", "main", "public"],
+    "main": ["main", "public"],
+    "public": ["public"],
+    "all_drivable": ["all_drivable"],
 }
 
 RAIL_VALUES = {"rail", "light_rail", "subway", "tram", "narrow_gauge", "monorail"}
@@ -102,8 +105,19 @@ class SnapResult:
     coverage_ratio: float
     outside_ratio: float
     missing_ratio: float
-    holes_removed_count: int
-    holes_removed_area_m2: float
+    holes_removed_count: int = 0
+    holes_removed_area_m2: float = 0.0
+    holes_filled_count: int = 0
+    coverage_target: float = 0.0
+    requested_road_tier: str | None = None
+    road_tier_used: str | None = None
+    auto_fallback_used: bool = False
+    selected_road_tier: str | None = None
+    selected_fit_mode: str | None = None
+    selected_seed_name: str | None = None
+    auto_retry_used: bool = False
+    retry_attempts_count: int = 1
+    coverage_rescue_added_cells: int = 0
     warning: str | None = None
 
 
@@ -184,36 +198,23 @@ def _filter_graph_edges(
     road_tier: RoadTier,
 ) -> nx.MultiDiGraph | nx.MultiGraph:
     filtered = graph.copy()
-
-    if isinstance(filtered, (nx.MultiGraph, nx.MultiDiGraph)):
-        to_remove = [
-            (u, v, k)
-            for u, v, k, attrs in filtered.edges(keys=True, data=True)
-            if not _edge_is_allowed(attrs, target=target, road_tier=road_tier)
-        ]
-        filtered.remove_edges_from(to_remove)
-    else:
-        to_remove = [
-            (u, v)
-            for u, v, attrs in filtered.edges(data=True)
-            if not _edge_is_allowed(attrs, target=target, road_tier=road_tier)
-        ]
-        filtered.remove_edges_from(to_remove)
-
+    to_remove = [
+        (u, v, k)
+        for u, v, k, attrs in filtered.edges(keys=True, data=True)
+        if not _edge_is_allowed(attrs, target=target, road_tier=road_tier)
+    ]
+    filtered.remove_edges_from(to_remove)
     filtered.remove_nodes_from(list(nx.isolates(filtered)))
     return filtered
 
 
 def _prune_dead_ends(graph: nx.MultiGraph) -> nx.MultiGraph:
-    """Remove dangling branches. Polygon boundaries should come from cyclic linework only."""
     pruned = graph.copy()
-
     while True:
         leaves = [node for node, degree in pruned.degree() if degree <= 1]
         if not leaves:
             break
         pruned.remove_nodes_from(leaves)
-
     if pruned.number_of_edges() == 0:
         return graph
     return pruned
@@ -230,6 +231,69 @@ def _line_geometries_from_edges(edges: gpd.GeoDataFrame) -> list[LineString]:
         elif geom.geom_type == "MultiLineString":
             lines.extend([part for part in geom.geoms if not part.is_empty and part.length > 0])
     return lines
+
+
+def _polygon_parts(geom: Any) -> list[Polygon]:
+    if geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type == "MultiPolygon":
+        return [part for part in geom.geoms if not part.is_empty and part.area > 0]
+    return []
+
+
+def _safe_union(polygons: list[Polygon]) -> Any:
+    if not polygons:
+        return Polygon()
+    geom = unary_union(polygons)
+    if not geom.is_valid:
+        geom = geom.buffer(0)
+    return geom
+
+
+def _count_interior_rings(geom: Any) -> int:
+    if geom.is_empty:
+        return 0
+    if geom.geom_type == "Polygon":
+        return len(geom.interiors)
+    if geom.geom_type == "MultiPolygon":
+        return sum(len(part.interiors) for part in geom.geoms)
+    return 0
+
+
+def _interior_ring_area_m2(geom: Any) -> float:
+    if geom.is_empty:
+        return 0.0
+    if geom.geom_type == "Polygon":
+        return float(sum(Polygon(ring).area for ring in geom.interiors))
+    if geom.geom_type == "MultiPolygon":
+        return float(sum(_interior_ring_area_m2(part) for part in geom.geoms))
+    return 0.0
+
+
+def _remove_polygon_holes(geom: Any) -> Any:
+    if geom.is_empty:
+        return geom
+    if geom.geom_type == "Polygon":
+        cleaned = Polygon(geom.exterior)
+        if not cleaned.is_valid:
+            cleaned = cleaned.buffer(0)
+        return cleaned
+    if geom.geom_type == "MultiPolygon":
+        parts: list[Polygon] = []
+        for part in geom.geoms:
+            if part.is_empty or part.area <= 0:
+                continue
+            cleaned = Polygon(part.exterior)
+            if not cleaned.is_valid:
+                cleaned = cleaned.buffer(0)
+            parts.extend(_polygon_parts(cleaned))
+        cleaned_union = _safe_union(parts)
+        if not cleaned_union.is_valid:
+            cleaned_union = cleaned_union.buffer(0)
+        return cleaned_union
+    return geom
 
 
 def _count_coordinates(geom: Any) -> int:
@@ -255,14 +319,12 @@ def _sample_line(line: Any, sample_count: int) -> list[Any]:
 
 
 def _mean_boundary_distance(candidate: Any, drawn_polygon: Polygon, sample_count: int = 60) -> float:
-    """A cheap symmetric average distance between output boundary and input boundary."""
     if candidate.is_empty:
         return 1e9
     cand_boundary = candidate.boundary
     drawn_boundary = drawn_polygon.boundary
     cand_points = _sample_line(cand_boundary, sample_count)
     drawn_points = _sample_line(drawn_boundary, sample_count)
-
     distances: list[float] = []
     distances.extend(point.distance(drawn_boundary) for point in cand_points)
     distances.extend(point.distance(cand_boundary) for point in drawn_points)
@@ -271,87 +333,24 @@ def _mean_boundary_distance(candidate: Any, drawn_polygon: Polygon, sample_count
     return float(np.mean(distances))
 
 
+def _coverage_target(mode: FitMode) -> float:
+    if mode == "tight":
+        return 0.62
+    if mode == "cover":
+        return 0.82
+    return 0.72
+
+
 def _fit_weights(mode: FitMode) -> dict[str, float]:
     if mode == "tight":
-        # Prefer staying inside/near the drawn polygon. Good for avoiding big outside bulges.
-        return {"coverage": 2.2, "outside": 2.8, "missing": 0.9, "area": 0.35, "boundary": 0.75, "simplicity": 0.015}
+        return {"coverage": 4.4, "outside": 2.5, "missing": 2.0, "area": 0.28, "boundary": 0.65, "simplicity": 0.018}
     if mode == "cover":
-        # Prefer covering the user's polygon, even if the snapped result expands outward.
-        return {"coverage": 2.8, "outside": 1.0, "missing": 2.2, "area": 0.30, "boundary": 0.65, "simplicity": 0.010}
-    # Balanced default: good first choice for inward/outward snapping.
-    return {"coverage": 2.5, "outside": 1.7, "missing": 1.5, "area": 0.35, "boundary": 0.70, "simplicity": 0.012}
-
-
-def _polygon_parts(geom: Any) -> list[Polygon]:
-    if geom.is_empty:
-        return []
-    if geom.geom_type == "Polygon":
-        return [geom]
-    if geom.geom_type == "MultiPolygon":
-        return [part for part in geom.geoms if not part.is_empty and part.area > 0]
-    return []
-
-
-def _count_interior_rings(geom: Any) -> int:
-    """Count interior rings/holes in a Polygon or MultiPolygon."""
-    if geom.is_empty:
-        return 0
-    if geom.geom_type == "Polygon":
-        return len(geom.interiors)
-    if geom.geom_type == "MultiPolygon":
-        return sum(len(part.interiors) for part in geom.geoms)
-    return 0
-
-
-def _interior_ring_area_m2(geom: Any) -> float:
-    """Area represented by polygon holes. Assumes the geometry CRS is projected in meters."""
-    if geom.is_empty:
-        return 0.0
-    if geom.geom_type == "Polygon":
-        return float(sum(Polygon(ring).area for ring in geom.interiors))
-    if geom.geom_type == "MultiPolygon":
-        return float(sum(_interior_ring_area_m2(part) for part in geom.geoms))
-    return 0.0
-
-
-def _remove_polygon_holes(geom: Any) -> Any:
-    """Return a clean outer outline by filling all interior rings/holes.
-
-    For this app, the user wants a simple snapped boundary polygon, not internal
-    island outlines. Polygonized road cells can create tiny triangular holes where
-    interior streets form closed cells; those show up as unwanted red triangles.
-    """
-    if geom.is_empty:
-        return geom
-
-    if geom.geom_type == "Polygon":
-        if not geom.interiors:
-            return geom
-        cleaned = Polygon(geom.exterior)
-        if not cleaned.is_valid:
-            cleaned = cleaned.buffer(0)
-        return cleaned
-
-    if geom.geom_type == "MultiPolygon":
-        cleaned_parts = []
-        for part in geom.geoms:
-            if part.is_empty or part.area <= 0:
-                continue
-            cleaned = Polygon(part.exterior)
-            if not cleaned.is_valid:
-                cleaned = cleaned.buffer(0)
-            cleaned_parts.extend(_polygon_parts(cleaned))
-        if not cleaned_parts:
-            return Polygon()
-        cleaned_union = unary_union(cleaned_parts)
-        if not cleaned_union.is_valid:
-            cleaned_union = cleaned_union.buffer(0)
-        return cleaned_union
-
-    return geom
+        return {"coverage": 5.1, "outside": 1.0, "missing": 3.1, "area": 0.22, "boundary": 0.55, "simplicity": 0.012}
+    return {"coverage": 4.7, "outside": 1.6, "missing": 2.5, "area": 0.25, "boundary": 0.60, "simplicity": 0.014}
 
 
 def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dict[str, float]:
+    candidate = _remove_polygon_holes(candidate)
     if candidate.is_empty:
         return {
             "score": -1e9,
@@ -359,6 +358,7 @@ def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dic
             "outside_ratio": 1.0,
             "missing_ratio": 1.0,
             "boundary_distance_m": 1e9,
+            "coverage_target": float(_coverage_target(mode)),
         }
 
     candidate_area = max(float(candidate.area), 1.0)
@@ -379,6 +379,12 @@ def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dic
     simplicity_penalty = coord_count / 1000.0
 
     weights = _fit_weights(mode)
+    coverage_target = _coverage_target(mode)
+    coverage_deficit = max(coverage_target - coverage_ratio, 0.0)
+    coverage_floor_penalty = 10.0 * coverage_deficit + 18.0 * (coverage_deficit**2)
+    if coverage_ratio < 0.40:
+        coverage_floor_penalty += 6.0 * (0.40 - coverage_ratio)
+
     score = (
         weights["coverage"] * coverage_ratio
         - weights["outside"] * outside_ratio
@@ -386,6 +392,7 @@ def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dic
         - weights["area"] * area_penalty
         - weights["boundary"] * boundary_distance_norm
         - weights["simplicity"] * simplicity_penalty
+        - coverage_floor_penalty
     )
 
     return {
@@ -394,28 +401,20 @@ def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dic
         "outside_ratio": float(outside_ratio),
         "missing_ratio": float(missing_ratio),
         "boundary_distance_m": float(boundary_distance_m),
+        "coverage_target": float(coverage_target),
     }
 
 
 def _best_single_component(geom: Any, drawn_polygon: Polygon, mode: FitMode) -> tuple[Any, bool, dict[str, float]]:
+    geom = _remove_polygon_holes(geom)
     parts = _polygon_parts(geom)
     if not parts:
         return geom, False, _score_polygon(geom, drawn_polygon, mode)
     if len(parts) == 1:
         return parts[0], False, _score_polygon(parts[0], drawn_polygon, mode)
-
     scored = [(part, _score_polygon(part, drawn_polygon, mode)) for part in parts]
     best_part, best_score = max(scored, key=lambda item: item[1]["score"])
     return best_part, True, best_score
-
-
-def _safe_union(polygons: list[Polygon]) -> Any:
-    if not polygons:
-        return Polygon()
-    geom = unary_union(polygons)
-    if not geom.is_valid:
-        geom = geom.buffer(0)
-    return geom
 
 
 def _initial_cell_selection(
@@ -426,41 +425,95 @@ def _initial_cell_selection(
 ) -> list[int]:
     selected: list[int] = []
     drawn_area = max(drawn_polygon.area, 1.0)
+    boundary = drawn_polygon.boundary
+    distance_scale = max(sqrt(drawn_area), 1.0)
+
+    relaxed_inside_ratio = max(0.12, float(min_cell_inside_ratio) * 0.55)
+    relaxed_outside_ratio = min(0.90, max(float(max_cell_outside_ratio), 0.68))
 
     for i, cell in enumerate(cells):
         inter_area = cell.intersection(drawn_polygon).area
         if inter_area <= 0:
             continue
-
-        inside_ratio = inter_area / max(cell.area, 1.0)
-        outside_ratio = max(cell.area - inter_area, 0.0) / max(cell.area, 1.0)
-        center_inside = cell.representative_point().within(drawn_polygon)
+        cell_area = max(cell.area, 1.0)
+        inside_ratio = inter_area / cell_area
+        outside_ratio = max(cell_area - inter_area, 0.0) / cell_area
         drawn_coverage = inter_area / drawn_area
+        rep_inside = cell.representative_point().within(drawn_polygon)
+        centroid_inside = cell.centroid.within(drawn_polygon)
+        boundary_distance_norm = cell.boundary.distance(boundary) / distance_scale
 
-        # The last clause catches large cells that cover a meaningful part of the drawn polygon.
-        # It is deliberately stricter than V4 to avoid huge outside bulges.
-        if inside_ratio >= min_cell_inside_ratio:
+        if rep_inside or centroid_inside:
             selected.append(i)
-        elif center_inside and outside_ratio <= max_cell_outside_ratio:
+        elif inside_ratio >= relaxed_inside_ratio and outside_ratio <= relaxed_outside_ratio:
             selected.append(i)
-        elif drawn_coverage >= 0.06 and outside_ratio <= max_cell_outside_ratio:
+        elif drawn_coverage >= 0.025 and outside_ratio <= 0.82:
+            selected.append(i)
+        elif drawn_coverage >= 0.010 and boundary_distance_norm <= 0.08:
             selected.append(i)
 
     if selected:
         return selected
 
-    # Fallback: pick a few cells with the best overlap with the drawn polygon.
     ranked = []
     for i, cell in enumerate(cells):
         inter_area = cell.intersection(drawn_polygon).area
         if inter_area <= 0:
             continue
-        inside_ratio = inter_area / max(cell.area, 1.0)
-        outside_ratio = max(cell.area - inter_area, 0.0) / max(cell.area, 1.0)
-        ranked.append((inside_ratio - outside_ratio, i))
+        cell_area = max(cell.area, 1.0)
+        drawn_coverage = inter_area / drawn_area
+        inside_ratio = inter_area / cell_area
+        outside_ratio = max(cell_area - inter_area, 0.0) / cell_area
+        ranked.append((drawn_coverage * 3.0 + inside_ratio - 0.25 * outside_ratio, i))
 
     ranked.sort(reverse=True)
-    return [i for _, i in ranked[:5]]
+    return [i for _, i in ranked[: min(12, len(ranked))]]
+
+
+def _candidate_seed_selections(
+    cells: list[Polygon],
+    drawn_polygon: Polygon,
+    min_cell_inside_ratio: float,
+    max_cell_outside_ratio: float,
+) -> list[tuple[str, list[int]]]:
+    seeds: list[tuple[str, list[int]]] = []
+    seen: set[tuple[int, ...]] = set()
+
+    def add(name: str, indices: list[int]) -> None:
+        unique = sorted(set(indices))
+        if not unique:
+            return
+        key = tuple(unique)
+        if key in seen:
+            return
+        seen.add(key)
+        seeds.append((name, unique))
+
+    add("mesh_overlap", _initial_cell_selection(cells, drawn_polygon, min_cell_inside_ratio, max_cell_outside_ratio))
+
+    center_indices = [
+        i
+        for i, cell in enumerate(cells)
+        if cell.intersects(drawn_polygon)
+        and (cell.representative_point().within(drawn_polygon) or cell.centroid.within(drawn_polygon))
+    ]
+    add("centers_inside", center_indices)
+
+    drawn_area = max(drawn_polygon.area, 1.0)
+    coverage_ranked = []
+    for i, cell in enumerate(cells):
+        inter_area = cell.intersection(drawn_polygon).area
+        if inter_area <= 0:
+            continue
+        cell_area = max(cell.area, 1.0)
+        outside_ratio = max(cell_area - inter_area, 0.0) / cell_area
+        drawn_coverage = inter_area / drawn_area
+        if drawn_coverage >= 0.006 and outside_ratio <= 0.88:
+            coverage_ranked.append((drawn_coverage, i))
+    coverage_ranked.sort(reverse=True)
+    add("coverage_ranked", [i for _, i in coverage_ranked[: min(40, len(coverage_ranked))]])
+
+    return seeds
 
 
 def _local_cell_refinement(
@@ -470,16 +523,10 @@ def _local_cell_refinement(
     mode: FitMode,
     max_iterations: int,
 ) -> tuple[list[int], Any, dict[str, float], int, int]:
-    """
-    Greedily remove/add whole road cells to improve shape fit.
-
-    This is the key V5 change. V4 selected all cells meeting a local overlap rule and
-    often kept the largest component. V5 scores the whole output polygon against the
-    user's drawn polygon, so outside bulges and disconnected artifacts are penalized.
-    """
     selected = set(selected_indices)
     remove_count = 0
     add_count = 0
+    coverage_target = _coverage_target(mode)
 
     def current_geometry(indices: set[int]) -> tuple[Any, dict[str, float], bool]:
         geom = _safe_union([cells[i] for i in sorted(indices)])
@@ -492,7 +539,6 @@ def _local_cell_refinement(
     for _ in range(max_iterations):
         changed = False
 
-        # Try removing cells. This removes the red bulges/pieces that do not help fit.
         best_remove: int | None = None
         best_remove_geom = current_geom
         best_remove_score = current_score
@@ -519,8 +565,6 @@ def _local_cell_refinement(
             remove_count += 1
             changed = True
 
-        # Try adding nearby cells that improve coverage without causing too much outside area.
-        # Keep this conservative to avoid swallowing whole neighborhoods.
         if len(selected) < len(cells):
             buffered_current = current_geom.buffer(1.0)
             candidate_adds = []
@@ -543,7 +587,11 @@ def _local_cell_refinement(
                 trial.add(idx)
                 trial_geom, trial_score, _ = current_geometry(trial)
                 trial_value = trial_score["score"]
-                if trial_value > best_add_value + 1e-6:
+                coverage_gain = trial_score["coverage_ratio"] - current_score["coverage_ratio"]
+                coverage_recovery = current_score["coverage_ratio"] < coverage_target and coverage_gain > 0.01
+                if trial_value > best_add_value + 1e-6 or coverage_recovery:
+                    if coverage_recovery and trial_value <= best_add_value + 1e-6:
+                        trial_value = best_add_value + coverage_gain
                     best_add = idx
                     best_add_geom = trial_geom
                     best_add_score = trial_score
@@ -586,7 +634,6 @@ def _build_fitted_cell_polygon(
     for cell in polygonize(noded_linework):
         if cell.is_empty or cell.area < float(min_cell_area_m2):
             continue
-        # Very large cells usually represent the exterior around sparse roads and cause bad bulges.
         if cell.area > max_cell_area:
             continue
         if not cell.intersects(drawn_polygon_projected):
@@ -594,27 +641,36 @@ def _build_fitted_cell_polygon(
         raw_cells.append(cell)
 
     if not raw_cells:
-        raise ValueError(
-            "No closed road cells intersect the drawn polygon. Try a larger search buffer, a lower road tier, or a lower minimum cell area."
-        )
+        raise ValueError("No closed road cells intersect the drawn polygon. Try moving Boundary detail right.")
 
-    initial_selected = _initial_cell_selection(
+    seed_sets = _candidate_seed_selections(
         cells=raw_cells,
         drawn_polygon=drawn_polygon_projected,
         min_cell_inside_ratio=min_cell_inside_ratio,
         max_cell_outside_ratio=max_cell_outside_ratio,
     )
+    if not seed_sets:
+        raise ValueError("Road cells were found, but none matched the drawn polygon closely enough.")
 
-    if not initial_selected:
-        raise ValueError("Road cells were found, but none matched the drawn polygon closely enough. Try Cover mode or lower thresholds.")
+    best_candidate: tuple[list[int], Any, dict[str, float], int, int, str] | None = None
+    for seed_name, seed_indices in seed_sets:
+        try:
+            trial_indices, trial_geom, trial_score, trial_removed, trial_added = _local_cell_refinement(
+                cells=raw_cells,
+                selected_indices=seed_indices,
+                drawn_polygon=drawn_polygon_projected,
+                mode=fit_mode,
+                max_iterations=max_refinement_iterations,
+            )
+        except Exception:
+            continue
+        if best_candidate is None or trial_score["score"] > best_candidate[2]["score"]:
+            best_candidate = (trial_indices, trial_geom, trial_score, trial_removed, trial_added, seed_name)
 
-    final_indices, fitted, score, removed, added = _local_cell_refinement(
-        cells=raw_cells,
-        selected_indices=initial_selected,
-        drawn_polygon=drawn_polygon_projected,
-        mode=fit_mode,
-        max_iterations=max_refinement_iterations,
-    )
+    if best_candidate is None:
+        raise ValueError("Road cells were found, but none could be refined into a usable polygon.")
+
+    final_indices, fitted, score, removed, added, selected_seed_name = best_candidate
 
     reduced_to_best = False
     holes_removed_count = 0
@@ -622,8 +678,6 @@ def _build_fitted_cell_polygon(
 
     fitted, reduced_to_best, score = _best_single_component(fitted, drawn_polygon_projected, fit_mode)
 
-    # V8: the product target is a simple outer polygon. Interior rings/holes
-    # are almost always visual artifacts from small road cells, so fill them.
     holes_removed_count += _count_interior_rings(fitted)
     holes_removed_area_m2 += _interior_ring_area_m2(fitted)
     fitted = _remove_polygon_holes(fitted)
@@ -635,27 +689,27 @@ def _build_fitted_cell_polygon(
         fitted = fitted.simplify(float(simplify_tolerance_m), preserve_topology=True)
         if not fitted.is_valid:
             fitted = fitted.buffer(0)
-
         holes_removed_count += _count_interior_rings(fitted)
         holes_removed_area_m2 += _interior_ring_area_m2(fitted)
         fitted = _remove_polygon_holes(fitted)
-
         fitted, reduced_again, score = _best_single_component(fitted, drawn_polygon_projected, fit_mode)
         reduced_to_best = reduced_to_best or reduced_again
         score = _score_polygon(fitted, drawn_polygon_projected, fit_mode)
 
     if fitted.is_empty:
-        raise ValueError("The snapped polygon became empty after fitting. Try a lower simplify tolerance.")
+        raise ValueError("The snapped polygon became empty after fitting. Try a lower Boundary detail value.")
 
     meta = {
         "candidate_cells_count": len(raw_cells),
-        "initially_selected_cells_count": len(initial_selected),
+        "initially_selected_cells_count": len(seed_sets),
         "final_selected_cells_count": len(final_indices),
+        "selected_seed_name": selected_seed_name,
         "fit_score": score["score"],
         "coverage_ratio": score["coverage_ratio"],
         "outside_ratio": score["outside_ratio"],
         "missing_ratio": score["missing_ratio"],
         "boundary_distance_m": score["boundary_distance_m"],
+        "coverage_target": score.get("coverage_target", _coverage_target(fit_mode)),
         "holes_removed_count": holes_removed_count,
         "holes_removed_area_m2": holes_removed_area_m2,
         "removed_cells_count": removed,
@@ -663,6 +717,139 @@ def _build_fitted_cell_polygon(
         "reduced_to_best": reduced_to_best,
     }
     return fitted, meta
+
+
+
+
+def _coverage_target_for_mode(mode: FitMode) -> float:
+    return _coverage_target(mode)
+
+
+def _outside_ceiling_for_mode(mode: FitMode) -> float:
+    if mode == "tight":
+        return 0.50
+    if mode == "cover":
+        return 0.76
+    return 0.62
+
+
+def _tier_fallbacks(road_tier: RoadTier, target: SnapTarget) -> list[RoadTier]:
+    if target == "rails":
+        return [road_tier]
+    return ROAD_TIER_FALLBACKS.get(road_tier, [road_tier])
+
+
+def _broadest_query_tier(road_tier: RoadTier, target: SnapTarget) -> RoadTier:
+    tiers = _tier_fallbacks(road_tier, target)
+    if "public" in tiers:
+        return "public"
+    if "main" in tiers:
+        return "main"
+    return road_tier
+
+
+def _choice_score_for_output(geom: Any, drawn_polygon: Polygon, mode: FitMode, tier_penalty: float = 0.0) -> float:
+    scored = _score_polygon(geom, drawn_polygon, mode)
+    coverage = scored["coverage_ratio"]
+    outside = scored["outside_ratio"]
+    missing = scored["missing_ratio"]
+    target = _coverage_target(mode)
+    outside_ceiling = _outside_ceiling_for_mode(mode)
+
+    value = 8.0 * coverage - 2.0 * outside - 3.0 * missing + 0.35 * scored["score"] - tier_penalty
+
+    if coverage < target:
+        gap = target - coverage
+        value -= 5.0 * gap + 8.0 * (gap**2)
+    if coverage < 0.45 and outside < 0.20:
+        value -= 3.0 + 5.0 * (0.45 - coverage)
+    if outside > outside_ceiling:
+        bulge = outside - outside_ceiling
+        value -= 3.0 * bulge + 5.0 * (bulge**2)
+
+    return float(value)
+
+def _attempt_specs_for_simple_ui(
+    *,
+    target: SnapTarget,
+    road_tier: RoadTier,
+    fit_mode: FitMode,
+    min_cell_area_m2: float,
+    max_cell_area_multiple: float,
+    min_cell_inside_ratio: float,
+    max_cell_outside_ratio: float,
+    simplify_tolerance_m: float,
+    max_refinement_iterations: int,
+) -> list[dict[str, Any]]:
+    """Hidden attempts behind the simple two-slider UI."""
+    specs: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add(
+        *,
+        tier: RoadTier,
+        mode: FitMode,
+        label: str,
+        min_area_factor: float = 1.0,
+        max_area_factor: float = 1.0,
+        inside_factor: float = 1.0,
+        outside_bonus: float = 0.0,
+        simplify_factor: float = 1.0,
+        iteration_bonus: int = 0,
+        tier_penalty: float = 0.0,
+    ) -> None:
+        spec = {
+            "tier": tier,
+            "mode": mode,
+            "label": label,
+            "min_cell_area_m2": max(80.0, float(min_cell_area_m2) * min_area_factor),
+            "max_cell_area_multiple": min(10.0, float(max_cell_area_multiple) * max_area_factor),
+            "min_cell_inside_ratio": max(0.05, min(0.95, float(min_cell_inside_ratio) * inside_factor)),
+            "max_cell_outside_ratio": max(0.05, min(0.95, float(max_cell_outside_ratio) + outside_bonus)),
+            "simplify_tolerance_m": max(1.0, float(simplify_tolerance_m) * simplify_factor),
+            "max_refinement_iterations": int(max_refinement_iterations) + int(iteration_bonus),
+            "tier_penalty": float(tier_penalty),
+        }
+        key = (
+            spec["tier"], spec["mode"], round(spec["min_cell_area_m2"], 1),
+            round(spec["max_cell_area_multiple"], 2), round(spec["min_cell_inside_ratio"], 2),
+            round(spec["max_cell_outside_ratio"], 2), round(spec["simplify_tolerance_m"], 1),
+        )
+        if key not in seen:
+            seen.add(key)
+            specs.append(spec)
+
+    add(tier=road_tier, mode=fit_mode, label="requested")
+
+    if fit_mode == "tight":
+        add(
+            tier=road_tier, mode="balanced", label="coverage_guard_same_tier",
+            min_area_factor=0.70, max_area_factor=1.45, inside_factor=0.75,
+            outside_bonus=0.16, simplify_factor=0.95, iteration_bonus=10, tier_penalty=0.04,
+        )
+    elif fit_mode == "balanced":
+        add(
+            tier=road_tier, mode="cover", label="coverage_guard_same_tier",
+            min_area_factor=0.70, max_area_factor=1.35, inside_factor=0.82,
+            outside_bonus=0.12, simplify_factor=0.95, iteration_bonus=10, tier_penalty=0.04,
+        )
+
+    for idx, tier in enumerate(_tier_fallbacks(road_tier, target)):
+        if tier == road_tier:
+            continue
+        penalty = 0.12 + idx * 0.05
+        add(
+            tier=tier, mode="balanced" if fit_mode != "cover" else "cover", label=f"broader_{tier}",
+            min_area_factor=0.55, max_area_factor=1.70, inside_factor=0.65,
+            outside_bonus=0.22, simplify_factor=0.90, iteration_bonus=16, tier_penalty=penalty,
+        )
+        add(
+            tier=tier, mode="cover", label=f"coverage_guard_{tier}",
+            min_area_factor=0.42, max_area_factor=2.20, inside_factor=0.50,
+            outside_bonus=0.32, simplify_factor=0.82, iteration_bonus=24, tier_penalty=penalty + 0.06,
+        )
+
+    return specs[:6]
 
 
 def snap_polygon_to_road_rail_polygon(
@@ -679,24 +866,14 @@ def snap_polygon_to_road_rail_polygon(
     fit_mode: FitMode = "balanced",
     max_refinement_iterations: int = 30,
 ) -> SnapResult:
-    """
-    Snap a drawn polygon to a best-fitting closed road/rail cell polygon.
-
-    V8 behavior:
-    - Direction is ignored: road graph is undirected.
-    - Footways, pedestrian paths, crossings, cycleways, tracks, and steps are excluded.
-    - Service roads are excluded unless road_tier='all_drivable'.
-    - Dead-end branches are removed before polygonizing.
-    - Whole closed cells are selected, then globally scored against the drawn polygon.
-    - The final component is chosen by best fit, not largest area.
-    - Interior holes are filled so the user sees one clean outer polygon, not red triangles/islands.
-    - Greedy refinement removes outside bulges and adds only cells that improve fit.
-    """
+    """Snap a drawn polygon to a coverage-guarded road/rail polygon."""
     polygon = _ensure_polygon_from_geojson(drawn_geojson)
     query_polygon_wgs84 = _buffer_polygon_meters(polygon, buffer_m=search_buffer_m)
+    target_coverage = _coverage_target_for_mode(fit_mode)
 
-    custom_filter = _custom_filter_for_target(target=target, road_tier=road_tier)
-    graph = ox.graph_from_polygon(
+    query_tier = _broadest_query_tier(road_tier, target)
+    custom_filter = _custom_filter_for_target(target=target, road_tier=query_tier)
+    graph_downloaded = ox.graph_from_polygon(
         query_polygon_wgs84,
         network_type="all",
         custom_filter=custom_filter,
@@ -705,54 +882,112 @@ def snap_polygon_to_road_rail_polygon(
         truncate_by_edge=True,
     )
 
-    if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
-        raise ValueError("No matching roads/rails were found near this polygon. Try increasing the search buffer or lowering the road tier.")
+    if graph_downloaded.number_of_nodes() == 0 or graph_downloaded.number_of_edges() == 0:
+        raise ValueError("No matching roads/rails were found near this polygon. Try increasing Fit or Boundary detail.")
 
-    graph = _filter_graph_edges(graph, target=target, road_tier=road_tier)
-    if graph.number_of_nodes() == 0 or graph.number_of_edges() == 0:
-        raise ValueError("All downloaded network edges were filtered out. Try Main roads or Public streets.")
-
-    graph_projected = ox.project_graph(graph)
-    graph_undirected = _to_undirected_graph(graph_projected)
-    if prune_dead_ends:
-        graph_undirected = _prune_dead_ends(graph_undirected)
-
-    nodes_projected, edges_projected = ox.graph_to_gdfs(graph_undirected, nodes=True, edges=True)
-    polygon_projected = _polygon_gdf(polygon).to_crs(nodes_projected.crs).geometry.iloc[0]
-
-    snapped_projected, meta = _build_fitted_cell_polygon(
-        edges_projected=edges_projected,
-        drawn_polygon_projected=polygon_projected,
+    specs = _attempt_specs_for_simple_ui(
+        target=target,
+        road_tier=road_tier,
+        fit_mode=fit_mode,
         min_cell_area_m2=min_cell_area_m2,
         max_cell_area_multiple=max_cell_area_multiple,
         min_cell_inside_ratio=min_cell_inside_ratio,
         max_cell_outside_ratio=max_cell_outside_ratio,
         simplify_tolerance_m=simplify_tolerance_m,
-        fit_mode=fit_mode,
         max_refinement_iterations=max_refinement_iterations,
     )
 
-    boundary_projected = snapped_projected.boundary
+    candidates: list[dict[str, Any]] = []
+    attempt_errors: list[str] = []
 
+    for attempt_number, spec in enumerate(specs, start=1):
+        try:
+            graph_attempt = _filter_graph_edges(graph_downloaded, target=target, road_tier=spec["tier"])
+            if graph_attempt.number_of_nodes() == 0 or graph_attempt.number_of_edges() == 0:
+                raise ValueError("no edges after filtering")
+
+            graph_projected = ox.project_graph(graph_attempt)
+            graph_undirected = _to_undirected_graph(graph_projected)
+            if prune_dead_ends:
+                graph_undirected = _prune_dead_ends(graph_undirected)
+
+            if graph_undirected.number_of_nodes() == 0 or graph_undirected.number_of_edges() == 0:
+                raise ValueError("no cyclic edges after pruning")
+
+            nodes_projected, edges_projected = ox.graph_to_gdfs(graph_undirected, nodes=True, edges=True)
+            polygon_projected = _polygon_gdf(polygon).to_crs(nodes_projected.crs).geometry.iloc[0]
+
+            snapped_projected, meta = _build_fitted_cell_polygon(
+                edges_projected=edges_projected,
+                drawn_polygon_projected=polygon_projected,
+                min_cell_area_m2=float(spec["min_cell_area_m2"]),
+                max_cell_area_multiple=float(spec["max_cell_area_multiple"]),
+                min_cell_inside_ratio=float(spec["min_cell_inside_ratio"]),
+                max_cell_outside_ratio=float(spec["max_cell_outside_ratio"]),
+                simplify_tolerance_m=float(spec["simplify_tolerance_m"]),
+                fit_mode=spec["mode"],
+                max_refinement_iterations=int(spec["max_refinement_iterations"]),
+            )
+
+            choice_score = _choice_score_for_output(
+                snapped_projected, polygon_projected, spec["mode"], tier_penalty=float(spec["tier_penalty"])
+            )
+
+            if attempt_number == 1 and meta["coverage_ratio"] >= target_coverage and meta["outside_ratio"] <= _outside_ceiling_for_mode(fit_mode):
+                choice_score += 0.25
+
+            candidates.append({
+                "choice_score": choice_score,
+                "attempt_number": attempt_number,
+                "spec": spec,
+                "graph": graph_undirected,
+                "nodes": nodes_projected,
+                "snapped_projected": snapped_projected,
+                "meta": meta,
+            })
+        except Exception as exc:  # noqa: BLE001
+            attempt_errors.append(f"{spec['label']} / {spec['tier']}: {exc}")
+            continue
+
+    if not candidates:
+        details = "; ".join(attempt_errors[:5])
+        raise ValueError(
+            "No clean closed road polygon could be formed. Move Boundary detail right, move Fit right, or draw a slightly larger polygon. " + details
+        )
+
+    best = max(candidates, key=lambda item: item["choice_score"])
+    spec = best["spec"]
+    meta = best["meta"]
+    snapped_projected = best["snapped_projected"]
+    graph_undirected = best["graph"]
+    nodes_projected = best["nodes"]
+
+    boundary_projected = snapped_projected.boundary
     snapped_wgs84 = gpd.GeoDataFrame(geometry=[snapped_projected], crs=nodes_projected.crs).to_crs("EPSG:4326").geometry.iloc[0]
     boundary_wgs84 = gpd.GeoDataFrame(geometry=[boundary_projected], crs=nodes_projected.crs).to_crs("EPSG:4326").geometry.iloc[0]
 
+    auto_retry_used = bool(best["attempt_number"] != 1 or spec["tier"] != road_tier or spec["mode"] != fit_mode)
+
     warning_parts: list[str] = []
+    if auto_retry_used:
+        warning_parts.append("The first pass looked too small, so V9 automatically tried a coverage-guarded road set.")
+    if spec["tier"] != road_tier:
+        warning_parts.append(f"Used {spec['tier']} roads internally because {road_tier} roads alone did not form a good enclosing loop.")
     if meta.get("reduced_to_best"):
-        warning_parts.append("Multiple closed components were possible, so the best-fitting component was kept instead of the largest one.")
+        warning_parts.append("Multiple closed components were possible, so the best-fitting component was kept.")
     if target != "roads":
-        warning_parts.append("Road+rail or rail-only snapping can create unusual cells where rail lines split road cells. Roads only is usually cleaner.")
-    if meta["coverage_ratio"] < 0.40:
-        warning_parts.append("The fitted polygon covers less than 40% of the drawn polygon. Try Cover mode, Public streets, or a larger search buffer.")
-    if meta["outside_ratio"] > 0.50:
-        warning_parts.append("More than half of the fitted polygon lies outside the drawn polygon. Try Tight mode or reduce max cell outside ratio.")
+        warning_parts.append("Road+rail or rail-only snapping can create unusual cells. Roads only is usually cleaner.")
+    if meta["coverage_ratio"] < target_coverage:
+        warning_parts.append(f"The fitted polygon still covers less than the internal target ({target_coverage:.0%}). Move Fit right or Boundary detail right if it looks too small.")
+    if meta["outside_ratio"] > max(0.60, _outside_ceiling_for_mode(fit_mode) + 0.15):
+        warning_parts.append("The fitted polygon has a large outside bulge. Move Fit left if this looks wrong.")
 
     return SnapResult(
         snapped_geojson=mapping(snapped_wgs84),
         snapped_boundary_geojson=mapping(boundary_wgs84),
         original_polygon_geojson=mapping(polygon),
         query_area_geojson=mapping(query_polygon_wgs84),
-        algorithm="best_fit_cell_polygonizer_v8_hole_free_outline",
+        algorithm="coverage_guard_outer_shell_polygonizer_v9",
         network_nodes_count=int(graph_undirected.number_of_nodes()),
         network_edges_count=int(graph_undirected.number_of_edges()),
         candidate_cells_count=int(meta["candidate_cells_count"]),
@@ -762,11 +997,21 @@ def snap_polygon_to_road_rail_polygon(
         output_perimeter_m=float(snapped_projected.length),
         coordinate_count=int(_count_coordinates(snapped_projected)),
         closed_loop=snapped_projected.geom_type in {"Polygon", "MultiPolygon"},
-        fit_score=float(meta["fit_score"]),
+        fit_score=float(best["choice_score"]),
         coverage_ratio=float(meta["coverage_ratio"]),
         outside_ratio=float(meta["outside_ratio"]),
         missing_ratio=float(meta["missing_ratio"]),
-        holes_removed_count=int(meta.get("holes_removed_count", 0)),
+        holes_removed_count=int(meta.get("holes_removed_count", meta.get("holes_filled_count", 0))),
         holes_removed_area_m2=float(meta.get("holes_removed_area_m2", 0.0)),
+        holes_filled_count=int(meta.get("holes_filled_count", meta.get("holes_removed_count", 0))),
+        requested_road_tier=str(road_tier),
+        road_tier_used=str(spec["tier"]),
+        auto_fallback_used=auto_retry_used,
         warning=" ".join(warning_parts) if warning_parts else None,
+        coverage_target=float(target_coverage),
+        selected_road_tier=str(spec["tier"]),
+        selected_fit_mode=str(spec["mode"]),
+        auto_retry_used=auto_retry_used,
+        retry_attempts_count=int(len(candidates)),
+        coverage_rescue_added_cells=int(meta.get("added_cells_count", 0)),
     )
