@@ -18,7 +18,7 @@ from streamlit_folium import st_folium
 from snapper import snap_polygon_to_road_rail_polygon
 
 
-APP_VERSION = "v10_outline_capture_cache_busted"
+APP_VERSION = "v11_clean_outline_faster_default"
 
 
 st.set_page_config(
@@ -46,6 +46,7 @@ def snap_cached(
     simplify_tolerance_m: float,
     max_refinement_iterations: int,
     boundary_capture_distance_m: float,
+    outline_cleanup_m: float,
 ) -> dict[str, Any]:
     drawn_geojson = json.loads(drawn_geojson_string)
     result = snap_polygon_to_road_rail_polygon(
@@ -62,6 +63,7 @@ def snap_cached(
         prune_dead_ends=True,
         max_refinement_iterations=int(max_refinement_iterations),
         boundary_capture_distance_m=float(boundary_capture_distance_m),
+        outline_cleanup_m=float(outline_cleanup_m),
     )
     return result.__dict__
 
@@ -93,37 +95,29 @@ def _derive_simple_settings(fit_slider: int, detail_slider: int, include_rail: b
         fit_mode = "cover"
         fit_label = "expanded / covers more of the drawing"
 
-    if detail_slider < 20:
+    if detail_slider < 25:
         road_tier = "arterial"
         road_label = "largest roads only"
-    elif detail_slider < 35:
+    elif detail_slider < 60:
         road_tier = "main"
-        road_label = "main roads"
+        road_label = "main roads, smoother outline"
     else:
-        # In dense cities, a visually correct enclosing polygon often needs
-        # normal public streets. This still excludes footways, paths, cycleways,
-        # tracks, crossings, and service roads.
         road_tier = "public"
         road_label = "normal streets, no paths or service roads"
 
     target = "roads_and_rails" if include_rail else "roads"
     target_label = "roads + rail lines" if include_rail else "roads only"
 
-    # Fit slider: left = tighter/contracted, right = looser/expanded.
-    search_buffer_m = _round_to(300 + (425 * fit) + (125 * detail), 25)
-    max_cell_area_multiple = round(1.80 + (3.40 * fit), 2)
-    min_cell_inside_ratio = round(0.50 - (0.32 * fit), 2)
-    max_cell_outside_ratio = round(0.40 + (0.45 * fit), 2)
+    search_buffer_m = _round_to(225 + (300 * fit) + (80 * detail), 25)
+    max_cell_area_multiple = round(1.80 + (3.20 * fit), 2)
+    min_cell_inside_ratio = round(0.50 - (0.30 * fit), 2)
+    max_cell_outside_ratio = round(0.40 + (0.42 * fit), 2)
 
-    # Detail slider: left = smoother/fewer points, right = sharper/more normal streets.
-    min_cell_area_m2 = _round_to(2600 - (2250 * detail), 50)
-    simplify_tolerance_m = round(30 - (25 * detail), 1)
-    max_refinement_iterations = int(round(24 + (30 * detail) + (16 * fit)))
-
-    # Hidden setting: how far the algorithm may look just outside the blue
-    # boundary for roads that form the enclosing outline. This is what fixes
-    # cases where the correct purple outline is outside the drawn polygon.
-    boundary_capture_distance_m = _round_to(90 + (185 * fit) + (65 * detail), 25)
+    min_cell_area_m2 = _round_to(3000 - (2550 * detail), 50)
+    simplify_tolerance_m = round(70 - (60 * detail), 1)
+    outline_cleanup_m = round(65 - (55 * detail), 1)
+    max_refinement_iterations = int(round(16 + (18 * detail) + (8 * fit)))
+    boundary_capture_distance_m = _round_to(75 + (150 * fit) + (50 * detail), 25)
 
     return {
         "app_version": APP_VERSION,
@@ -145,6 +139,7 @@ def _derive_simple_settings(fit_slider: int, detail_slider: int, include_rail: b
         "prune_dead_ends": True,
         "max_refinement_iterations": int(max_refinement_iterations),
         "boundary_capture_distance_m": float(boundary_capture_distance_m),
+        "outline_cleanup_m": float(outline_cleanup_m),
     }
 
 
@@ -175,6 +170,11 @@ def _metrics_from_result(result: dict[str, Any]) -> dict[str, Any]:
         "output_area_m2",
         "output_perimeter_m",
         "coordinate_count",
+        "pre_cleanup_coordinate_count",
+        "post_cleanup_coordinate_count",
+        "outline_cleanup_m",
+        "outline_cleanup_applied",
+        "outline_cleanup_method",
         "holes_removed_count",
         "holes_removed_area_m2",
         "requested_road_tier",
@@ -219,7 +219,7 @@ def _build_export_objects(
         properties={
             "display_color": "red",
             "algorithm": result.get("algorithm"),
-            "note": "Polygon returned by the snapping algorithm. V10 uses outline capture, stronger coverage checks, and cache-busted runs.",
+            "note": "Polygon returned by the snapping algorithm. V11 uses outline capture, stronger coverage checks, and final outline cleanup.",
         },
     )
     output_boundary_feature = _as_feature(
@@ -390,17 +390,17 @@ For now, your desired purple output can stay hand-drawn on the screenshot.
 
 
 def _clear_previous_result_if_needed(drawn_geojson_string: str, current_case_key: str) -> None:
-    previous_drawn_string = st.session_state.get("drawn_geojson_string_v10")
-    previous_case_key = st.session_state.get("snap_result_case_key_v10")
+    previous_drawn_string = st.session_state.get("drawn_geojson_string_v11")
+    previous_case_key = st.session_state.get("snap_result_case_key_v11")
     if previous_drawn_string and previous_drawn_string != drawn_geojson_string:
-        st.session_state.pop("snap_result_v10", None)
-        st.session_state.pop("snap_settings_v10", None)
-        st.session_state.pop("drawn_geojson_v10", None)
-        st.session_state.pop("snap_result_case_key_v10", None)
-        st.session_state.pop("snap_result_case_id_v10", None)
+        st.session_state.pop("snap_result_v11", None)
+        st.session_state.pop("snap_settings_v11", None)
+        st.session_state.pop("drawn_geojson_v11", None)
+        st.session_state.pop("snap_result_case_key_v11", None)
+        st.session_state.pop("snap_result_case_id_v11", None)
     elif previous_case_key and previous_case_key != current_case_key:
-        st.session_state.pop("snap_result_v10", None)
-    st.session_state["drawn_geojson_string_v10"] = drawn_geojson_string
+        st.session_state.pop("snap_result_v11", None)
+    st.session_state["drawn_geojson_string_v11"] = drawn_geojson_string
 
 
 st.markdown(
@@ -438,7 +438,7 @@ with left:
         height=650,
         width=None,
         returned_objects=["all_drawings", "last_active_drawing"],
-        key="draw_map_v10",
+        key="draw_map_v11",
     )
 
 with right:
@@ -458,11 +458,11 @@ with right:
         "Boundary detail",
         min_value=0,
         max_value=100,
-        value=50,
+        value=40,
         step=5,
         help="Move left for a cleaner shape with fewer points and larger roads. Move right if the boundary needs smaller normal streets to close properly.",
     )
-    st.caption("← smoother / fewer points ····························· sharper / smaller roads →")
+    st.caption("← smoother / faster / fewer points ····················· sharper / smaller roads →")
 
     include_rail = st.checkbox(
         "Allow rail lines as boundaries",
@@ -520,26 +520,27 @@ with right:
                     simplify_tolerance_m=float(settings_now["simplify_tolerance_m"]),
                     max_refinement_iterations=int(settings_now["max_refinement_iterations"]),
                     boundary_capture_distance_m=float(settings_now["boundary_capture_distance_m"]),
+                    outline_cleanup_m=float(settings_now["outline_cleanup_m"]),
                 )
-                st.session_state["snap_result_v10"] = result
-                st.session_state["snap_settings_v10"] = settings_now
-                st.session_state["drawn_geojson_v10"] = drawn
-                st.session_state["snap_result_case_key_v10"] = current_case_key
-                st.session_state["snap_result_case_id_v10"] = current_case_id
+                st.session_state["snap_result_v11"] = result
+                st.session_state["snap_settings_v11"] = settings_now
+                st.session_state["drawn_geojson_v11"] = drawn
+                st.session_state["snap_result_case_key_v11"] = current_case_key
+                st.session_state["snap_result_case_id_v11"] = current_case_id
             except Exception as exc:  # noqa: BLE001
                 st.error(str(exc))
                 st.stop()
 
-    result = st.session_state.get("snap_result_v10")
-    result_case_key = st.session_state.get("snap_result_case_key_v10")
+    result = st.session_state.get("snap_result_v11")
+    result_case_key = st.session_state.get("snap_result_case_key_v11")
 
     if result and result_case_key != current_case_key:
         st.info("The polygon or controls changed. Click **Snap polygon** again to update the red output.")
         result = None
 
     if result:
-        settings_used = st.session_state.get("snap_settings_v10", settings_now)
-        drawn_for_result = st.session_state.get("drawn_geojson_v10", drawn)
+        settings_used = st.session_state.get("snap_settings_v11", settings_now)
+        drawn_for_result = st.session_state.get("drawn_geojson_v11", drawn)
 
         if result.get("warning"):
             st.warning(result["warning"])
@@ -569,7 +570,7 @@ with right:
         if result.get("boundary_inside_ratio", 1.0) < 0.65:
             tips.append("Result is ignoring part of the blue outline: move **Fit** right.")
         if result["coordinate_count"] > 250:
-            tips.append("Result is too jagged: move **Boundary detail** left.")
+            tips.append("Result is too jagged: move **Boundary detail** left. V11 also cleans small spikes automatically.")
         if tips:
             st.caption(" ".join(tips))
         else:
@@ -586,7 +587,7 @@ with right:
             result=result,
             settings_used=settings_used,
             issue_notes=issue_notes,
-            case_id=st.session_state.get("snap_result_case_id_v10", current_case_id),
+            case_id=st.session_state.get("snap_result_case_id_v11", current_case_id),
         )
         metrics = _metrics_from_result(result)
         debug_map_html = _build_debug_map_html(export_objects, settings_used, metrics)
@@ -637,13 +638,13 @@ with right:
         st.write("Click **Snap polygon** after drawing your polygon.")
 
 
-result = st.session_state.get("snap_result_v10")
-result_case_key = st.session_state.get("snap_result_case_key_v10")
+result = st.session_state.get("snap_result_v11")
+result_case_key = st.session_state.get("snap_result_case_key_v11")
 
 if result and result_case_key == json.dumps(
     {
-        "drawn": st.session_state.get("drawn_geojson_v10"),
-        "settings": st.session_state.get("snap_settings_v10"),
+        "drawn": st.session_state.get("drawn_geojson_v11"),
+        "settings": st.session_state.get("snap_settings_v11"),
     },
     sort_keys=True,
 ):
@@ -651,10 +652,10 @@ if result and result_case_key == json.dumps(
     pass
 
 # Render preview based on the saved result, even if the user is about to change settings.
-result = st.session_state.get("snap_result_v10")
+result = st.session_state.get("snap_result_v11")
 if result:
-    drawn_for_result = st.session_state.get("drawn_geojson_v10")
-    settings_used = st.session_state.get("snap_settings_v10")
+    drawn_for_result = st.session_state.get("drawn_geojson_v11")
+    settings_used = st.session_state.get("snap_settings_v11")
     if drawn_for_result and settings_used:
         st.divider()
         st.subheader("Preview")
@@ -664,7 +665,7 @@ if result:
             result=result,
             settings_used=settings_used,
             issue_notes="",
-            case_id=st.session_state.get("snap_result_case_id_v10"),
+            case_id=st.session_state.get("snap_result_case_id_v11"),
         )
 
         minx, miny, maxx, maxy = _bounds_for_features(
@@ -685,4 +686,4 @@ if result:
         ).add_to(preview)
         folium.LayerControl().add_to(preview)
         preview.fit_bounds([[miny, minx], [maxy, maxx]])
-        st_folium(preview, height=520, width=None, key="preview_map_v10")
+        st_folium(preview, height=520, width=None, key="preview_map_v11")

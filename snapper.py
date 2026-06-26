@@ -11,6 +11,12 @@ import osmnx as ox
 from shapely.geometry import LineString, Point, Polygon, mapping, shape
 from shapely.ops import polygonize, unary_union
 
+# Faster repeated runs in Streamlit/OSMnx. The first query still has to hit
+# Overpass, but repeated polygons/settings can reuse OSMnx's local HTTP cache.
+ox.settings.use_cache = True
+ox.settings.log_console = False
+ox.settings.requests_timeout = 180
+
 SnapTarget = Literal["roads", "rails", "roads_and_rails"]
 RoadTier = Literal["arterial", "main", "public", "all_drivable"]
 FitMode = Literal["balanced", "tight", "cover"]
@@ -121,6 +127,11 @@ class SnapResult:
     boundary_inside_ratio: float = 0.0
     vertices_inside_ratio: float = 0.0
     boundary_capture_distance_m: float = 0.0
+    outline_cleanup_m: float = 0.0
+    pre_cleanup_coordinate_count: int = 0
+    post_cleanup_coordinate_count: int = 0
+    outline_cleanup_applied: bool = False
+    outline_cleanup_method: str | None = None
     warning: str | None = None
 
 
@@ -371,7 +382,7 @@ def _drawn_vertex_containment_ratio(candidate: Any, drawn_polygon: Polygon) -> f
 
 def _coverage_target(mode: FitMode) -> float:
     # A snapped boundary should normally enclose most of the user drawing.
-    # V10 raises these targets so a small internal road cell cannot win just
+    # V11 raises these targets so a small internal road cell cannot win just
     # because it has low outside bulge.
     if mode == "tight":
         return 0.70
@@ -469,6 +480,130 @@ def _best_single_component(geom: Any, drawn_polygon: Polygon, mode: FitMode) -> 
     best_part, best_score = max(scored, key=lambda item: item[1]["score"])
     return best_part, True, best_score
 
+
+
+def _normalize_polygon_candidate(geom: Any, drawn_polygon: Polygon, mode: FitMode) -> tuple[Any, dict[str, float]] | None:
+    if geom is None or geom.is_empty:
+        return None
+    if not geom.is_valid:
+        geom = geom.buffer(0)
+    geom = _remove_polygon_holes(geom)
+    geom, _, _ = _best_single_component(geom, drawn_polygon, mode)
+    if geom.is_empty or geom.geom_type not in {"Polygon", "MultiPolygon"}:
+        return None
+    return geom, _score_polygon(geom, drawn_polygon, mode)
+
+
+def _clean_outline_value(candidate: Any, score: dict[str, float], base_score: dict[str, float], base_coords: int) -> float:
+    coords = max(_count_coordinates(candidate), 1)
+    simplicity_gain = max(base_coords - coords, 0) / max(float(base_coords), 1.0)
+    return float(
+        score["score"]
+        + 2.10 * simplicity_gain
+        - 0.008 * coords
+        - 6.0 * max(0.0, base_score["coverage_ratio"] - score["coverage_ratio"] - 0.035)
+        - 4.0 * max(0.0, score["outside_ratio"] - base_score["outside_ratio"] - 0.060)
+    )
+
+
+def _final_outline_cleanup(
+    geom: Any,
+    drawn_polygon: Polygon,
+    mode: FitMode,
+    cleanup_tolerance_m: float,
+) -> tuple[Any, dict[str, float], dict[str, Any]]:
+    """Remove small road-mesh teeth while keeping the same broad road shell."""
+    normalized = _normalize_polygon_candidate(geom, drawn_polygon, mode)
+    if normalized is None:
+        score = _score_polygon(geom, drawn_polygon, mode)
+        coords = _count_coordinates(geom)
+        return geom, score, {
+            "outline_cleanup_m": 0.0,
+            "outline_cleanup_applied": False,
+            "outline_cleanup_method": None,
+            "pre_clean_coordinate_count": int(coords),
+            "post_clean_coordinate_count": int(coords),
+        }
+
+    base_geom, base_score = normalized
+    base_coords = max(_count_coordinates(base_geom), 1)
+    base_area = max(float(base_geom.area), 1.0)
+    cleanup = max(0.0, float(cleanup_tolerance_m))
+
+    candidates: list[tuple[float, int, str, float, Any, dict[str, float]]] = []
+
+    def add_candidate(name: str, candidate: Any, tolerance: float, bonus: float = 0.0) -> None:
+        normalized_candidate = _normalize_polygon_candidate(candidate, drawn_polygon, mode)
+        if normalized_candidate is None:
+            return
+        candidate_geom, candidate_score = normalized_candidate
+        coords = _count_coordinates(candidate_geom)
+        if coords < 4:
+            return
+        # Do not allow smoothing to become a different polygon.
+        if candidate_score["coverage_ratio"] + 0.055 < base_score["coverage_ratio"]:
+            return
+        if candidate_score["missing_ratio"] > base_score["missing_ratio"] + 0.080:
+            return
+        if candidate_score["outside_ratio"] > base_score["outside_ratio"] + 0.110:
+            return
+        if candidate_score.get("boundary_inside_ratio", 0.0) + 0.10 < base_score.get("boundary_inside_ratio", 0.0):
+            return
+        area_ratio = float(candidate_geom.area) / base_area
+        if area_ratio < 0.78 or area_ratio > 1.27:
+            return
+        value = _clean_outline_value(candidate_geom, candidate_score, base_score, base_coords) + float(bonus)
+        candidates.append((value, int(coords), name, float(tolerance), candidate_geom, candidate_score))
+
+    add_candidate("base", base_geom, 0.0)
+
+    if cleanup > 0:
+        for factor in (0.80, 1.00, 1.30, 1.70, 2.20):
+            tol = cleanup * factor
+            try:
+                add_candidate("simplify", base_geom.simplify(tol, preserve_topology=True), tol, bonus=0.04)
+            except Exception:
+                pass
+            try:
+                add_candidate("simplify_non_topology", base_geom.simplify(tol, preserve_topology=False), tol, bonus=0.06)
+            except Exception:
+                pass
+
+        # Tiny morphological closing/opening removes needle-like protrusions and
+        # inward notches that are caused by internal side streets.
+        morph = min(max(cleanup * 0.70, 0.0), 45.0)
+        if morph > 2.0:
+            try:
+                add_candidate("close_notches", base_geom.buffer(morph, join_style=2).buffer(-morph, join_style=2), morph, bonus=0.08)
+            except Exception:
+                pass
+            try:
+                add_candidate("remove_spikes", base_geom.buffer(-morph, join_style=2).buffer(morph, join_style=2), morph, bonus=0.08)
+            except Exception:
+                pass
+
+    if not candidates:
+        return base_geom, base_score, {
+            "outline_cleanup_m": 0.0,
+            "outline_cleanup_applied": False,
+            "outline_cleanup_method": None,
+            "pre_clean_coordinate_count": int(base_coords),
+            "post_clean_coordinate_count": int(base_coords),
+        }
+
+    # Strongly prefer the simplest safe geometry, but avoid a very poor score.
+    candidates.sort(key=lambda item: (item[1], -item[0]))
+    simplest = candidates[0]
+    best_value = max(candidates, key=lambda item: item[0])
+    chosen = simplest if simplest[0] >= best_value[0] - 0.45 else best_value
+    value, coords, method, tolerance, chosen_geom, chosen_score = chosen
+    return chosen_geom, chosen_score, {
+        "outline_cleanup_m": float(tolerance),
+        "outline_cleanup_applied": bool(method != "base"),
+        "outline_cleanup_method": None if method == "base" else method,
+        "pre_clean_coordinate_count": int(base_coords),
+        "post_clean_coordinate_count": int(coords),
+    }
 
 def _initial_cell_selection(
     cells: list[Polygon],
@@ -704,6 +839,7 @@ def _build_fitted_cell_polygon(
     min_cell_inside_ratio: float,
     max_cell_outside_ratio: float,
     simplify_tolerance_m: float,
+    outline_cleanup_m: float,
     fit_mode: FitMode,
     max_refinement_iterations: int,
     boundary_capture_distance_m: float = 0.0,
@@ -790,6 +926,21 @@ def _build_fitted_cell_polygon(
         reduced_to_best = reduced_to_best or reduced_again
         score = _score_polygon(fitted, drawn_polygon_projected, fit_mode)
 
+    cleanup_meta = {
+        "outline_cleanup_m": 0.0,
+        "outline_cleanup_applied": False,
+        "outline_cleanup_method": None,
+        "pre_clean_coordinate_count": int(_count_coordinates(fitted)),
+        "post_clean_coordinate_count": int(_count_coordinates(fitted)),
+    }
+    if outline_cleanup_m and outline_cleanup_m > 0:
+        fitted, score, cleanup_meta = _final_outline_cleanup(
+            fitted,
+            drawn_polygon_projected,
+            fit_mode,
+            cleanup_tolerance_m=float(outline_cleanup_m),
+        )
+
     if fitted.is_empty:
         raise ValueError("The snapped polygon became empty after fitting. Try a lower Boundary detail value.")
 
@@ -812,6 +963,11 @@ def _build_fitted_cell_polygon(
         "removed_cells_count": removed,
         "added_cells_count": added,
         "reduced_to_best": reduced_to_best,
+        "outline_cleanup_m": float(cleanup_meta.get("outline_cleanup_m", 0.0)),
+        "outline_cleanup_applied": bool(cleanup_meta.get("outline_cleanup_applied", False)),
+        "outline_cleanup_method": cleanup_meta.get("outline_cleanup_method"),
+        "pre_clean_coordinate_count": int(cleanup_meta.get("pre_clean_coordinate_count", _count_coordinates(fitted))),
+        "post_clean_coordinate_count": int(cleanup_meta.get("post_clean_coordinate_count", _count_coordinates(fitted))),
     }
     return fitted, meta
 
@@ -837,11 +993,10 @@ def _tier_fallbacks(road_tier: RoadTier, target: SnapTarget) -> list[RoadTier]:
 
 
 def _broadest_query_tier(road_tier: RoadTier, target: SnapTarget) -> RoadTier:
-    tiers = _tier_fallbacks(road_tier, target)
-    if "public" in tiers:
-        return "public"
-    if "main" in tiers:
-        return "main"
+    # V11 speed/default-cleanliness choice: query the road tier selected by the
+    # Boundary detail slider. Earlier versions queried the broadest fallback
+    # tier up front, which was slower and introduced side-street jaggedness.
+    # Move Boundary detail right to query normal public streets when needed.
     return road_tier
 
 
@@ -893,6 +1048,7 @@ def _attempt_specs_for_simple_ui(
     min_cell_inside_ratio: float,
     max_cell_outside_ratio: float,
     simplify_tolerance_m: float,
+    outline_cleanup_m: float,
     max_refinement_iterations: int,
 ) -> list[dict[str, Any]]:
     """Hidden attempts behind the simple two-slider UI."""
@@ -909,6 +1065,7 @@ def _attempt_specs_for_simple_ui(
         inside_factor: float = 1.0,
         outside_bonus: float = 0.0,
         simplify_factor: float = 1.0,
+        cleanup_factor: float = 1.0,
         iteration_bonus: int = 0,
         tier_penalty: float = 0.0,
     ) -> None:
@@ -921,13 +1078,14 @@ def _attempt_specs_for_simple_ui(
             "min_cell_inside_ratio": max(0.05, min(0.95, float(min_cell_inside_ratio) * inside_factor)),
             "max_cell_outside_ratio": max(0.05, min(0.95, float(max_cell_outside_ratio) + outside_bonus)),
             "simplify_tolerance_m": max(1.0, float(simplify_tolerance_m) * simplify_factor),
+            "outline_cleanup_m": max(0.0, float(outline_cleanup_m) * cleanup_factor),
             "max_refinement_iterations": int(max_refinement_iterations) + int(iteration_bonus),
             "tier_penalty": float(tier_penalty),
         }
         key = (
             spec["tier"], spec["mode"], round(spec["min_cell_area_m2"], 1),
             round(spec["max_cell_area_multiple"], 2), round(spec["min_cell_inside_ratio"], 2),
-            round(spec["max_cell_outside_ratio"], 2), round(spec["simplify_tolerance_m"], 1),
+            round(spec["max_cell_outside_ratio"], 2), round(spec["simplify_tolerance_m"], 1), round(spec["outline_cleanup_m"], 1),
         )
         if key not in seen:
             seen.add(key)
@@ -939,13 +1097,13 @@ def _attempt_specs_for_simple_ui(
         add(
             tier=road_tier, mode="balanced", label="coverage_guard_same_tier",
             min_area_factor=0.70, max_area_factor=1.45, inside_factor=0.75,
-            outside_bonus=0.16, simplify_factor=0.95, iteration_bonus=10, tier_penalty=0.04,
+            outside_bonus=0.16, simplify_factor=0.95, cleanup_factor=1.05, iteration_bonus=6, tier_penalty=0.04,
         )
     elif fit_mode == "balanced":
         add(
             tier=road_tier, mode="cover", label="coverage_guard_same_tier",
             min_area_factor=0.70, max_area_factor=1.35, inside_factor=0.82,
-            outside_bonus=0.12, simplify_factor=0.95, iteration_bonus=10, tier_penalty=0.04,
+            outside_bonus=0.12, simplify_factor=0.95, cleanup_factor=1.05, iteration_bonus=6, tier_penalty=0.04,
         )
 
     for idx, tier in enumerate(_tier_fallbacks(road_tier, target)):
@@ -955,15 +1113,15 @@ def _attempt_specs_for_simple_ui(
         add(
             tier=tier, mode="balanced" if fit_mode != "cover" else "cover", label=f"broader_{tier}",
             min_area_factor=0.55, max_area_factor=1.70, inside_factor=0.65,
-            outside_bonus=0.22, simplify_factor=0.90, iteration_bonus=16, tier_penalty=penalty,
+            outside_bonus=0.22, simplify_factor=0.90, cleanup_factor=1.15, iteration_bonus=10, tier_penalty=penalty,
         )
         add(
             tier=tier, mode="cover", label=f"coverage_guard_{tier}",
             min_area_factor=0.42, max_area_factor=2.20, inside_factor=0.50,
-            outside_bonus=0.32, simplify_factor=0.82, iteration_bonus=24, tier_penalty=penalty + 0.06,
+            outside_bonus=0.32, simplify_factor=0.82, cleanup_factor=1.20, iteration_bonus=14, tier_penalty=penalty + 0.06,
         )
 
-    return specs[:6]
+    return specs[:4]
 
 
 def snap_polygon_to_road_rail_polygon(
@@ -976,6 +1134,7 @@ def snap_polygon_to_road_rail_polygon(
     min_cell_inside_ratio: float = 0.35,
     max_cell_outside_ratio: float = 0.65,
     simplify_tolerance_m: float = 12,
+    outline_cleanup_m: float | None = None,
     prune_dead_ends: bool = True,
     fit_mode: FitMode = "balanced",
     max_refinement_iterations: int = 30,
@@ -989,21 +1148,9 @@ def snap_polygon_to_road_rail_polygon(
         # Hidden outline allowance. This lets the snapped boundary move to nearby
         # enclosing roads rather than only using cells that intersect the blue polygon.
         fit_capture_factor = {"tight": 0.22, "balanced": 0.32, "cover": 0.42}.get(fit_mode, 0.32)
-        boundary_capture_distance_m = max(80.0, min(275.0, float(search_buffer_m) * fit_capture_factor))
-
-    query_tier = _broadest_query_tier(road_tier, target)
-    custom_filter = _custom_filter_for_target(target=target, road_tier=query_tier)
-    graph_downloaded = ox.graph_from_polygon(
-        query_polygon_wgs84,
-        network_type="all",
-        custom_filter=custom_filter,
-        simplify=True,
-        retain_all=True,
-        truncate_by_edge=True,
-    )
-
-    if graph_downloaded.number_of_nodes() == 0 or graph_downloaded.number_of_edges() == 0:
-        raise ValueError("No matching roads/rails were found near this polygon. Try increasing Fit or Boundary detail.")
+        boundary_capture_distance_m = max(60.0, min(240.0, float(search_buffer_m) * fit_capture_factor))
+    if outline_cleanup_m is None:
+        outline_cleanup_m = max(8.0, float(simplify_tolerance_m) * 1.35)
 
     specs = _attempt_specs_for_simple_ui(
         target=target,
@@ -1014,20 +1161,42 @@ def snap_polygon_to_road_rail_polygon(
         min_cell_inside_ratio=min_cell_inside_ratio,
         max_cell_outside_ratio=max_cell_outside_ratio,
         simplify_tolerance_m=simplify_tolerance_m,
+        outline_cleanup_m=float(outline_cleanup_m),
         max_refinement_iterations=max_refinement_iterations,
     )
+
+    # V11 speed-up: query the clean requested road tier first. Only if a later
+    # fallback is actually attempted do we query the broader tier. This avoids
+    # loading all residential streets for easy main-road cases.
+    projected_graph_cache: dict[RoadTier, nx.MultiDiGraph | nx.MultiGraph] = {}
+
+    def projected_graph_for_tier(query_tier: RoadTier) -> nx.MultiDiGraph | nx.MultiGraph:
+        if query_tier not in projected_graph_cache:
+            custom_filter = _custom_filter_for_target(target=target, road_tier=query_tier)
+            downloaded = ox.graph_from_polygon(
+                query_polygon_wgs84,
+                network_type="all",
+                custom_filter=custom_filter,
+                simplify=True,
+                retain_all=True,
+                truncate_by_edge=True,
+            )
+            if downloaded.number_of_nodes() == 0 or downloaded.number_of_edges() == 0:
+                raise ValueError("no matching road/rail edges found")
+            projected_graph_cache[query_tier] = ox.project_graph(downloaded)
+        return projected_graph_cache[query_tier]
 
     candidates: list[dict[str, Any]] = []
     attempt_errors: list[str] = []
 
     for attempt_number, spec in enumerate(specs, start=1):
         try:
-            graph_attempt = _filter_graph_edges(graph_downloaded, target=target, road_tier=spec["tier"])
+            graph_projected_downloaded = projected_graph_for_tier(spec["tier"])
+            graph_attempt = _filter_graph_edges(graph_projected_downloaded, target=target, road_tier=spec["tier"])
             if graph_attempt.number_of_nodes() == 0 or graph_attempt.number_of_edges() == 0:
                 raise ValueError("no edges after filtering")
 
-            graph_projected = ox.project_graph(graph_attempt)
-            graph_undirected = _to_undirected_graph(graph_projected)
+            graph_undirected = _to_undirected_graph(graph_attempt)
             if prune_dead_ends:
                 graph_undirected = _prune_dead_ends(graph_undirected)
 
@@ -1045,6 +1214,7 @@ def snap_polygon_to_road_rail_polygon(
                 min_cell_inside_ratio=float(spec["min_cell_inside_ratio"]),
                 max_cell_outside_ratio=float(spec["max_cell_outside_ratio"]),
                 simplify_tolerance_m=float(spec["simplify_tolerance_m"]),
+                outline_cleanup_m=float(spec.get("outline_cleanup_m", outline_cleanup_m)),
                 fit_mode=spec["mode"],
                 max_refinement_iterations=int(spec["max_refinement_iterations"]),
                 boundary_capture_distance_m=float(boundary_capture_distance_m),
@@ -1066,6 +1236,16 @@ def snap_polygon_to_road_rail_polygon(
                 "snapped_projected": snapped_projected,
                 "meta": meta,
             })
+
+            if (
+                attempt_number <= 2
+                and spec["tier"] == road_tier
+                and meta["coverage_ratio"] >= target_coverage
+                and meta["outside_ratio"] <= _outside_ceiling_for_mode(fit_mode)
+                and meta.get("boundary_inside_ratio", 0.0) >= 0.72
+                and int(_count_coordinates(snapped_projected)) <= 90
+            ):
+                break
         except Exception as exc:  # noqa: BLE001
             attempt_errors.append(f"{spec['label']} / {spec['tier']}: {exc}")
             continue
@@ -1091,7 +1271,9 @@ def snap_polygon_to_road_rail_polygon(
 
     warning_parts: list[str] = []
     if auto_retry_used:
-        warning_parts.append("The first pass looked too small, so V10 automatically tried a coverage-guarded road set.")
+        warning_parts.append("The first pass looked too small, so V11 automatically tried a coverage-guarded road set.")
+    if meta.get("outline_cleanup_applied"):
+        warning_parts.append("V11 cleaned small spikes/dents from the outer outline to reduce jaggy edges.")
     if spec["tier"] != road_tier:
         warning_parts.append(f"Used {spec['tier']} roads internally because {road_tier} roads alone did not form a good enclosing loop.")
     if meta.get("reduced_to_best"):
@@ -1110,7 +1292,7 @@ def snap_polygon_to_road_rail_polygon(
         snapped_boundary_geojson=mapping(boundary_wgs84),
         original_polygon_geojson=mapping(polygon),
         query_area_geojson=mapping(query_polygon_wgs84),
-        algorithm="outline_capture_coverage_guard_polygonizer_v10",
+        algorithm="smoother_fast_outline_polygonizer_v11",
         network_nodes_count=int(graph_undirected.number_of_nodes()),
         network_edges_count=int(graph_undirected.number_of_edges()),
         candidate_cells_count=int(meta["candidate_cells_count"]),
@@ -1140,4 +1322,9 @@ def snap_polygon_to_road_rail_polygon(
         boundary_inside_ratio=float(meta.get("boundary_inside_ratio", 0.0)),
         vertices_inside_ratio=float(meta.get("vertices_inside_ratio", 0.0)),
         boundary_capture_distance_m=float(boundary_capture_distance_m),
+        outline_cleanup_m=float(meta.get("outline_cleanup_m", outline_cleanup_m or 0.0)),
+        pre_cleanup_coordinate_count=int(meta.get("pre_clean_coordinate_count", _count_coordinates(snapped_projected))),
+        post_cleanup_coordinate_count=int(meta.get("post_clean_coordinate_count", _count_coordinates(snapped_projected))),
+        outline_cleanup_applied=bool(meta.get("outline_cleanup_applied", False)),
+        outline_cleanup_method=meta.get("outline_cleanup_method"),
     )

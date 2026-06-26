@@ -1,29 +1,18 @@
-# Road Polygon Snapper V10
+# Road Polygon Snapper V11
 
-A Streamlit prototype for drawing a rough polygon and snapping it to a clean closed polygon formed by nearby OpenStreetMap roads, with optional rail-line support.
+A Streamlit prototype for snapping a rough user-drawn polygon to a clean road/rail-bounded polygon using OpenStreetMap data.
 
-## What V10 changes
+## What V11 changes
 
-V10 focuses on the latest failure cases where the red output became too small even though a larger, obvious road-bounded outline existed.
+V11 is tuned for a simpler end-user experience:
 
-Changes:
-
-- Adds an **outline capture** pass so cells just outside the blue input polygon can be considered.
-- Raises the internal coverage target so a small internal road block is much less likely to win.
-- Penalizes outputs that ignore large parts of the blue outline or its vertices.
-- Keeps the normal user interface simple: only **Fit**, **Boundary detail**, and an optional rail checkbox.
-- Adds a cache-buster to the Streamlit cached snap function, so old red outputs should not survive app updates.
-- Adds a hidden **Advanced > Clear cached snap results** button for debugging.
-
-## Files
-
-```text
-app.py
-snapper.py
-requirements.txt
-README.md
-.gitignore
-```
+- Keeps the UI to two main sliders: **Fit** and **Boundary detail**.
+- Defaults to a smoother outline using main roads first.
+- Uses normal public streets only when the user moves Boundary detail far right or when the algorithm needs a fallback.
+- Adds a hidden final outline cleanup step to remove small side-street teeth, narrow spikes, and triangular protrusions.
+- Reduces default search size and internal retries for faster runs.
+- Projects the OSM graph once per run before hidden attempts to reduce repeated work.
+- Keeps debug ZIP export for reporting failures.
 
 ## Run locally
 
@@ -43,20 +32,31 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## User workflow
+## Deploy on Streamlit Community Cloud
 
-1. Draw one rough polygon.
-2. Click **Snap polygon**.
-3. Adjust **Fit** if the red output is too small or too large.
-4. Adjust **Boundary detail** if the red output is too jagged or needs smaller streets.
-5. Use **Export / debug files** only when you need to share a failed case.
+1. Push these files to GitHub.
+2. Create a new Streamlit app.
+3. Set the main file path to `app.py`.
+4. Deploy.
 
-## Debug workflow
+## User controls
 
-For algorithm refinement, export the debug ZIP and share it with a screenshot where:
+**Fit**
+
+- Move left if the red polygon bulges too far outside the blue drawing.
+- Move right if the red polygon misses too much of the blue drawing.
+
+**Boundary detail**
+
+- Move left for smoother/faster/fewer points.
+- Move right if smaller normal streets are needed to form a closed polygon.
+
+## Debugging
+
+If an output is wrong, export the debug ZIP and send it with a screenshot showing:
 
 - blue = input polygon
 - red = algorithm output
-- purple = desired output, drawn manually on the screenshot
+- purple = desired output drawn manually
 
-The debug ZIP contains input/output GeoJSON, settings, metrics, and an HTML map.
+The debug ZIP contains the input/output GeoJSON, settings, metrics, and an HTML map.
