@@ -8,7 +8,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import osmnx as ox
-from shapely.geometry import LineString, Polygon, mapping, shape
+from shapely.geometry import LineString, Point, Polygon, mapping, shape
 from shapely.ops import polygonize, unary_union
 
 SnapTarget = Literal["roads", "rails", "roads_and_rails"]
@@ -118,6 +118,9 @@ class SnapResult:
     auto_retry_used: bool = False
     retry_attempts_count: int = 1
     coverage_rescue_added_cells: int = 0
+    boundary_inside_ratio: float = 0.0
+    vertices_inside_ratio: float = 0.0
+    boundary_capture_distance_m: float = 0.0
     warning: str | None = None
 
 
@@ -333,20 +336,56 @@ def _mean_boundary_distance(candidate: Any, drawn_polygon: Polygon, sample_count
     return float(np.mean(distances))
 
 
+def _drawn_boundary_containment_ratio(candidate: Any, drawn_polygon: Polygon, sample_count: int = 64) -> float:
+    """Return the share of drawn-boundary samples covered by the candidate.
+
+    This guards against the old failure mode where a neat little internal road
+    cell won the score even though it ignored a large side of the user drawing.
+    A small tolerance is used because snapped roads can sit just outside the
+    rough hand-drawn blue line.
+    """
+    if candidate.is_empty or drawn_polygon.is_empty:
+        return 0.0
+    drawn_area = max(float(drawn_polygon.area), 1.0)
+    tolerance_m = max(8.0, min(45.0, sqrt(drawn_area) * 0.025))
+    candidate_with_tolerance = candidate.buffer(tolerance_m)
+    points = _sample_line(drawn_polygon.boundary, sample_count)
+    if not points:
+        return 0.0
+    covered = sum(1 for point in points if candidate_with_tolerance.covers(point))
+    return float(covered / len(points))
+
+
+def _drawn_vertex_containment_ratio(candidate: Any, drawn_polygon: Polygon) -> float:
+    if candidate.is_empty or drawn_polygon.is_empty:
+        return 0.0
+    drawn_area = max(float(drawn_polygon.area), 1.0)
+    tolerance_m = max(10.0, min(60.0, sqrt(drawn_area) * 0.03))
+    candidate_with_tolerance = candidate.buffer(tolerance_m)
+    vertices = list(drawn_polygon.exterior.coords)[:-1]
+    if not vertices:
+        return 0.0
+    covered = sum(1 for x, y in vertices if candidate_with_tolerance.covers(Point(x, y)))
+    return float(covered / len(vertices))
+
+
 def _coverage_target(mode: FitMode) -> float:
+    # A snapped boundary should normally enclose most of the user drawing.
+    # V10 raises these targets so a small internal road cell cannot win just
+    # because it has low outside bulge.
     if mode == "tight":
-        return 0.62
+        return 0.70
     if mode == "cover":
-        return 0.82
-    return 0.72
+        return 0.90
+    return 0.82
 
 
 def _fit_weights(mode: FitMode) -> dict[str, float]:
     if mode == "tight":
-        return {"coverage": 4.4, "outside": 2.5, "missing": 2.0, "area": 0.28, "boundary": 0.65, "simplicity": 0.018}
+        return {"coverage": 5.8, "outside": 2.8, "missing": 3.5, "area": 0.26, "boundary": 0.70, "simplicity": 0.018, "boundary_inside": 2.2, "vertices_inside": 1.2}
     if mode == "cover":
-        return {"coverage": 5.1, "outside": 1.0, "missing": 3.1, "area": 0.22, "boundary": 0.55, "simplicity": 0.012}
-    return {"coverage": 4.7, "outside": 1.6, "missing": 2.5, "area": 0.25, "boundary": 0.60, "simplicity": 0.014}
+        return {"coverage": 7.0, "outside": 1.2, "missing": 4.7, "area": 0.20, "boundary": 0.58, "simplicity": 0.012, "boundary_inside": 3.2, "vertices_inside": 1.6}
+    return {"coverage": 6.4, "outside": 1.7, "missing": 4.2, "area": 0.23, "boundary": 0.62, "simplicity": 0.014, "boundary_inside": 2.8, "vertices_inside": 1.4}
 
 
 def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dict[str, float]:
@@ -359,6 +398,8 @@ def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dic
             "missing_ratio": 1.0,
             "boundary_distance_m": 1e9,
             "coverage_target": float(_coverage_target(mode)),
+            "boundary_inside_ratio": 0.0,
+            "vertices_inside_ratio": 0.0,
         }
 
     candidate_area = max(float(candidate.area), 1.0)
@@ -375,24 +416,34 @@ def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dic
     distance_scale = max(sqrt(drawn_area), 1.0)
     boundary_distance_norm = boundary_distance_m / distance_scale
 
+    boundary_inside_ratio = _drawn_boundary_containment_ratio(candidate, drawn_polygon, sample_count=64)
+    vertices_inside_ratio = _drawn_vertex_containment_ratio(candidate, drawn_polygon)
+
     coord_count = _count_coordinates(candidate)
     simplicity_penalty = coord_count / 1000.0
 
     weights = _fit_weights(mode)
     coverage_target = _coverage_target(mode)
     coverage_deficit = max(coverage_target - coverage_ratio, 0.0)
-    coverage_floor_penalty = 10.0 * coverage_deficit + 18.0 * (coverage_deficit**2)
-    if coverage_ratio < 0.40:
-        coverage_floor_penalty += 6.0 * (0.40 - coverage_ratio)
+    coverage_floor_penalty = 12.0 * coverage_deficit + 28.0 * (coverage_deficit**2)
+    if coverage_ratio < 0.55:
+        coverage_floor_penalty += 7.0 * (0.55 - coverage_ratio)
+
+    boundary_deficit = max(0.72 - boundary_inside_ratio, 0.0)
+    vertex_deficit = max(0.75 - vertices_inside_ratio, 0.0)
+    containment_penalty = 6.0 * boundary_deficit + 7.0 * (boundary_deficit**2) + 3.5 * vertex_deficit
 
     score = (
         weights["coverage"] * coverage_ratio
+        + weights["boundary_inside"] * boundary_inside_ratio
+        + weights["vertices_inside"] * vertices_inside_ratio
         - weights["outside"] * outside_ratio
         - weights["missing"] * missing_ratio
         - weights["area"] * area_penalty
         - weights["boundary"] * boundary_distance_norm
         - weights["simplicity"] * simplicity_penalty
         - coverage_floor_penalty
+        - containment_penalty
     )
 
     return {
@@ -402,6 +453,8 @@ def _score_polygon(candidate: Any, drawn_polygon: Polygon, mode: FitMode) -> dic
         "missing_ratio": float(missing_ratio),
         "boundary_distance_m": float(boundary_distance_m),
         "coverage_target": float(coverage_target),
+        "boundary_inside_ratio": float(boundary_inside_ratio),
+        "vertices_inside_ratio": float(vertices_inside_ratio),
     }
 
 
@@ -475,6 +528,7 @@ def _candidate_seed_selections(
     drawn_polygon: Polygon,
     min_cell_inside_ratio: float,
     max_cell_outside_ratio: float,
+    boundary_capture_distance_m: float,
 ) -> list[tuple[str, list[int]]]:
     seeds: list[tuple[str, list[int]]] = []
     seen: set[tuple[int, ...]] = set()
@@ -500,18 +554,49 @@ def _candidate_seed_selections(
     add("centers_inside", center_indices)
 
     drawn_area = max(drawn_polygon.area, 1.0)
+    drawn_boundary = drawn_polygon.boundary
+    distance_scale = max(sqrt(drawn_area), 1.0)
+    capture = max(0.0, float(boundary_capture_distance_m))
+    buffered_polygon = drawn_polygon.buffer(capture) if capture > 0 else drawn_polygon
+    buffered_boundary_band = drawn_boundary.buffer(capture) if capture > 0 else drawn_boundary.buffer(1.0)
+
     coverage_ranked = []
+    buffered_ranked = []
+    boundary_ranked = []
+
     for i, cell in enumerate(cells):
         inter_area = cell.intersection(drawn_polygon).area
-        if inter_area <= 0:
-            continue
         cell_area = max(cell.area, 1.0)
         outside_ratio = max(cell_area - inter_area, 0.0) / cell_area
         drawn_coverage = inter_area / drawn_area
+        boundary_distance_norm = cell.boundary.distance(drawn_boundary) / distance_scale
+
         if drawn_coverage >= 0.006 and outside_ratio <= 0.88:
             coverage_ranked.append((drawn_coverage, i))
+
+        if capture > 0 and cell.intersects(buffered_polygon):
+            buffered_intersection = cell.intersection(buffered_polygon).area / cell_area
+            center_ok = cell.representative_point().within(buffered_polygon) or cell.centroid.within(buffered_polygon)
+            near_boundary = cell.intersects(buffered_boundary_band) or cell.boundary.distance(drawn_boundary) <= capture
+            if center_ok or near_boundary or buffered_intersection >= 0.25:
+                # Prefer cells that are near the user's outline and not enormous outside bulges.
+                rank = (1.8 * drawn_coverage) + (0.9 * buffered_intersection) - (0.40 * outside_ratio) - (0.35 * boundary_distance_norm)
+                buffered_ranked.append((rank, i))
+
+        # A separate outline seed catches the Melbourne/Paris style failure where
+        # the best visual boundary requires a few cells just outside the blue line.
+        if capture > 0 and cell.intersects(buffered_boundary_band):
+            boundary_intersection = cell.intersection(buffered_boundary_band).area / cell_area
+            rank = (1.5 * boundary_intersection) + (1.5 * drawn_coverage) - (0.25 * outside_ratio) - (0.25 * boundary_distance_norm)
+            boundary_ranked.append((rank, i))
+
     coverage_ranked.sort(reverse=True)
-    add("coverage_ranked", [i for _, i in coverage_ranked[: min(40, len(coverage_ranked))]])
+    buffered_ranked.sort(reverse=True)
+    boundary_ranked.sort(reverse=True)
+
+    add("coverage_ranked", [i for _, i in coverage_ranked[: min(60, len(coverage_ranked))]])
+    add("buffered_outline", [i for _, i in buffered_ranked[: min(90, len(buffered_ranked))]])
+    add("boundary_band", [i for _, i in boundary_ranked[: min(70, len(boundary_ranked))]])
 
     return seeds
 
@@ -621,6 +706,7 @@ def _build_fitted_cell_polygon(
     simplify_tolerance_m: float,
     fit_mode: FitMode,
     max_refinement_iterations: int,
+    boundary_capture_distance_m: float = 0.0,
 ) -> tuple[Any, dict[str, Any]]:
     lines = _line_geometries_from_edges(edges_projected)
     if not lines:
@@ -631,23 +717,31 @@ def _build_fitted_cell_polygon(
     max_cell_area = drawn_area * float(max_cell_area_multiple)
 
     raw_cells = []
+    capture = max(0.0, float(boundary_capture_distance_m))
+    drawn_boundary = drawn_polygon_projected.boundary
+    buffered_polygon = drawn_polygon_projected.buffer(capture) if capture > 0 else drawn_polygon_projected
+    boundary_band = drawn_boundary.buffer(capture) if capture > 0 else drawn_boundary.buffer(1.0)
+
     for cell in polygonize(noded_linework):
         if cell.is_empty or cell.area < float(min_cell_area_m2):
             continue
         if cell.area > max_cell_area:
             continue
-        if not cell.intersects(drawn_polygon_projected):
+        intersects_input = cell.intersects(drawn_polygon_projected)
+        near_input = capture > 0 and (cell.intersects(buffered_polygon) or cell.intersects(boundary_band) or cell.distance(drawn_polygon_projected) <= capture)
+        if not (intersects_input or near_input):
             continue
         raw_cells.append(cell)
 
     if not raw_cells:
-        raise ValueError("No closed road cells intersect the drawn polygon. Try moving Boundary detail right.")
+        raise ValueError("No closed road cells were found near the drawn polygon. Try moving Boundary detail right or Fit right.")
 
     seed_sets = _candidate_seed_selections(
         cells=raw_cells,
         drawn_polygon=drawn_polygon_projected,
         min_cell_inside_ratio=min_cell_inside_ratio,
         max_cell_outside_ratio=max_cell_outside_ratio,
+        boundary_capture_distance_m=boundary_capture_distance_m,
     )
     if not seed_sets:
         raise ValueError("Road cells were found, but none matched the drawn polygon closely enough.")
@@ -710,6 +804,9 @@ def _build_fitted_cell_polygon(
         "missing_ratio": score["missing_ratio"],
         "boundary_distance_m": score["boundary_distance_m"],
         "coverage_target": score.get("coverage_target", _coverage_target(fit_mode)),
+        "boundary_inside_ratio": score.get("boundary_inside_ratio", 0.0),
+        "vertices_inside_ratio": score.get("vertices_inside_ratio", 0.0),
+        "boundary_capture_distance_m": float(boundary_capture_distance_m),
         "holes_removed_count": holes_removed_count,
         "holes_removed_area_m2": holes_removed_area_m2,
         "removed_cells_count": removed,
@@ -756,13 +853,30 @@ def _choice_score_for_output(geom: Any, drawn_polygon: Polygon, mode: FitMode, t
     target = _coverage_target(mode)
     outside_ceiling = _outside_ceiling_for_mode(mode)
 
-    value = 8.0 * coverage - 2.0 * outside - 3.0 * missing + 0.35 * scored["score"] - tier_penalty
+    boundary_inside = scored.get("boundary_inside_ratio", 0.0)
+    vertices_inside = scored.get("vertices_inside_ratio", 0.0)
+
+    value = (
+        10.0 * coverage
+        + 2.6 * boundary_inside
+        + 1.4 * vertices_inside
+        - 2.2 * outside
+        - 4.4 * missing
+        + 0.35 * scored["score"]
+        - tier_penalty
+    )
 
     if coverage < target:
         gap = target - coverage
-        value -= 5.0 * gap + 8.0 * (gap**2)
-    if coverage < 0.45 and outside < 0.20:
-        value -= 3.0 + 5.0 * (0.45 - coverage)
+        value -= 7.0 * gap + 14.0 * (gap**2)
+    if coverage < 0.60 and outside < 0.25:
+        # Small internal cells often have attractive outside-bulge scores.
+        # Make that failure mode very expensive.
+        value -= 4.0 + 8.0 * (0.60 - coverage)
+    if boundary_inside < 0.65:
+        value -= 4.5 * (0.65 - boundary_inside)
+    if vertices_inside < 0.75:
+        value -= 2.5 * (0.75 - vertices_inside)
     if outside > outside_ceiling:
         bulge = outside - outside_ceiling
         value -= 3.0 * bulge + 5.0 * (bulge**2)
@@ -865,11 +979,17 @@ def snap_polygon_to_road_rail_polygon(
     prune_dead_ends: bool = True,
     fit_mode: FitMode = "balanced",
     max_refinement_iterations: int = 30,
+    boundary_capture_distance_m: float | None = None,
 ) -> SnapResult:
     """Snap a drawn polygon to a coverage-guarded road/rail polygon."""
     polygon = _ensure_polygon_from_geojson(drawn_geojson)
     query_polygon_wgs84 = _buffer_polygon_meters(polygon, buffer_m=search_buffer_m)
     target_coverage = _coverage_target_for_mode(fit_mode)
+    if boundary_capture_distance_m is None:
+        # Hidden outline allowance. This lets the snapped boundary move to nearby
+        # enclosing roads rather than only using cells that intersect the blue polygon.
+        fit_capture_factor = {"tight": 0.22, "balanced": 0.32, "cover": 0.42}.get(fit_mode, 0.32)
+        boundary_capture_distance_m = max(80.0, min(275.0, float(search_buffer_m) * fit_capture_factor))
 
     query_tier = _broadest_query_tier(road_tier, target)
     custom_filter = _custom_filter_for_target(target=target, road_tier=query_tier)
@@ -927,6 +1047,7 @@ def snap_polygon_to_road_rail_polygon(
                 simplify_tolerance_m=float(spec["simplify_tolerance_m"]),
                 fit_mode=spec["mode"],
                 max_refinement_iterations=int(spec["max_refinement_iterations"]),
+                boundary_capture_distance_m=float(boundary_capture_distance_m),
             )
 
             choice_score = _choice_score_for_output(
@@ -970,7 +1091,7 @@ def snap_polygon_to_road_rail_polygon(
 
     warning_parts: list[str] = []
     if auto_retry_used:
-        warning_parts.append("The first pass looked too small, so V9 automatically tried a coverage-guarded road set.")
+        warning_parts.append("The first pass looked too small, so V10 automatically tried a coverage-guarded road set.")
     if spec["tier"] != road_tier:
         warning_parts.append(f"Used {spec['tier']} roads internally because {road_tier} roads alone did not form a good enclosing loop.")
     if meta.get("reduced_to_best"):
@@ -979,6 +1100,8 @@ def snap_polygon_to_road_rail_polygon(
         warning_parts.append("Road+rail or rail-only snapping can create unusual cells. Roads only is usually cleaner.")
     if meta["coverage_ratio"] < target_coverage:
         warning_parts.append(f"The fitted polygon still covers less than the internal target ({target_coverage:.0%}). Move Fit right or Boundary detail right if it looks too small.")
+    if meta.get("boundary_inside_ratio", 0.0) < 0.60:
+        warning_parts.append("The fitted polygon does not contain enough of the blue outline. Move Fit right if it looks too small.")
     if meta["outside_ratio"] > max(0.60, _outside_ceiling_for_mode(fit_mode) + 0.15):
         warning_parts.append("The fitted polygon has a large outside bulge. Move Fit left if this looks wrong.")
 
@@ -987,7 +1110,7 @@ def snap_polygon_to_road_rail_polygon(
         snapped_boundary_geojson=mapping(boundary_wgs84),
         original_polygon_geojson=mapping(polygon),
         query_area_geojson=mapping(query_polygon_wgs84),
-        algorithm="coverage_guard_outer_shell_polygonizer_v9",
+        algorithm="outline_capture_coverage_guard_polygonizer_v10",
         network_nodes_count=int(graph_undirected.number_of_nodes()),
         network_edges_count=int(graph_undirected.number_of_edges()),
         candidate_cells_count=int(meta["candidate_cells_count"]),
@@ -1014,4 +1137,7 @@ def snap_polygon_to_road_rail_polygon(
         auto_retry_used=auto_retry_used,
         retry_attempts_count=int(len(candidates)),
         coverage_rescue_added_cells=int(meta.get("added_cells_count", 0)),
+        boundary_inside_ratio=float(meta.get("boundary_inside_ratio", 0.0)),
+        vertices_inside_ratio=float(meta.get("vertices_inside_ratio", 0.0)),
+        boundary_capture_distance_m=float(boundary_capture_distance_m),
     )
