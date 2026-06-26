@@ -21,6 +21,8 @@ SnapTarget = Literal["roads", "rails", "roads_and_rails"]
 RoadTier = Literal["arterial", "main", "public", "all_drivable"]
 FitMode = Literal["balanced", "tight", "cover"]
 
+SNAPPER_VERSION = "v11.1_outline_cleanup_compat"
+
 # Deliberately exclude footway/path/pedestrian/crossing/cycleway/track/steps.
 # This app is drawing a road/rail polygon boundary, not a human route.
 ROAD_TIERS: dict[RoadTier, set[str]] = {
@@ -1139,6 +1141,7 @@ def snap_polygon_to_road_rail_polygon(
     fit_mode: FitMode = "balanced",
     max_refinement_iterations: int = 30,
     boundary_capture_distance_m: float | None = None,
+    **extra_options: Any,
 ) -> SnapResult:
     """Snap a drawn polygon to a coverage-guarded road/rail polygon."""
     polygon = _ensure_polygon_from_geojson(drawn_geojson)
@@ -1292,7 +1295,7 @@ def snap_polygon_to_road_rail_polygon(
         snapped_boundary_geojson=mapping(boundary_wgs84),
         original_polygon_geojson=mapping(polygon),
         query_area_geojson=mapping(query_polygon_wgs84),
-        algorithm="smoother_fast_outline_polygonizer_v11",
+        algorithm="smoother_fast_outline_polygonizer_v11_1",
         network_nodes_count=int(graph_undirected.number_of_nodes()),
         network_edges_count=int(graph_undirected.number_of_edges()),
         candidate_cells_count=int(meta["candidate_cells_count"]),

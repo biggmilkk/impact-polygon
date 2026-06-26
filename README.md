@@ -1,10 +1,14 @@
-# Road Polygon Snapper V11
+# Road/Rail Polygon Snapper - V11.1
+
+This build fixes the `outline_cleanup_m` keyword mismatch by making the snapper signature explicit and forward-compatible. Replace both `app.py` and `snapper.py`, then restart Streamlit or clear the app cache.
+
+# Road Polygon Snapper V11.1
 
 A Streamlit prototype for snapping a rough user-drawn polygon to a clean road/rail-bounded polygon using OpenStreetMap data.
 
-## What V11 changes
+## What V11.1 changes
 
-V11 is tuned for a simpler end-user experience:
+V11.1 is tuned for a simpler end-user experience:
 
 - Keeps the UI to two main sliders: **Fit** and **Boundary detail**.
 - Defaults to a smoother outline using main roads first.
@@ -60,3 +64,8 @@ If an output is wrong, export the debug ZIP and send it with a screenshot showin
 - purple = desired output drawn manually
 
 The debug ZIP contains the input/output GeoJSON, settings, metrics, and an HTML map.
+
+
+## V11.1 note
+
+This patch adds a mismatch-safe app-to-snapper call. The earlier `outline_cleanup_m` error means `app.py` was newer than `snapper.py` or Streamlit was still importing an older module. Deploy all files from this folder together, then reboot the Streamlit app.
